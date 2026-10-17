@@ -44,6 +44,12 @@ def no_tools(name: str) -> None:
     return None
 
 
+@pytest.fixture(autouse=True)
+def _like_ci(monkeypatch):
+    """Behave like a fresh CI runner: Python writes bytecode next to the code it imports."""
+    monkeypatch.delenv("PYTHONDONTWRITEBYTECODE", raising=False)
+
+
 @pytest.fixture
 def paths(tmp_path: Path):
     p = resolve_paths(str(tmp_path / "orch-home"))

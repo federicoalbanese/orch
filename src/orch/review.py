@@ -98,6 +98,9 @@ def render_bundle(b: dict[str, Any]) -> str:
             *[f"- {c['status']} {c['path']}" + (f" (from {c['old_path']})" if c.get("old_path") else "")
               for c in ev["changes"]],
         ]
+        if ev.get("check_artifacts"):
+            lines.append("Created by the engine's checks (not attributed to the executor): "
+                         + ", ".join(ev["check_artifacts"][:20]))
         d = ev["discrepancies"]
         if d["claimed_not_changed"] or d["changed_not_claimed"]:
             lines.append(f"Discrepancies with the report: claimed but unchanged {d['claimed_not_changed']}, "

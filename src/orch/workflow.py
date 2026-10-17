@@ -149,6 +149,10 @@ class Engine:
         return problems, executor_name
 
     def _last_after_tree(self, task_id: str) -> str | None:
+        """The tree as the engine last left it for this task (after its checks ran)."""
+        for ev in reversed(self.store.task_evidence(task_id)):
+            if ev.get("checks_tree") or ev.get("after"):
+                return ev.get("checks_tree") or ev["after"]["tree"]
         for run in reversed(self.store.list_runs(task_id)):
             if run.get("after_tree"):
                 return run["after_tree"]
@@ -268,9 +272,14 @@ class Engine:
                 return outcome
 
             self.store.transition_task(task_id, TaskStatus.VERIFYING, "engine", "collecting evidence")
-            ev = evidence.collect(root, baseline, before, task.spec, pcfg, result.report)
+            prior = {p for e in self.store.task_evidence(task_id) for p in e.get("attempt_changed_files", [])}
+            ev = evidence.collect(root, baseline, before, task.spec, pcfg, result.report, prior)
             self.store.update_run(run_id, after_tree=ev["after"]["tree"])
             ev["checks"] = evidence.run_checks(root, project, checks, limits("evidence_output_bytes"))
+            post = evidence.snapshot(root)
+            artifacts, _, _ = evidence.diff_trees(root, ev["after"]["tree"], post.tree, 1000)
+            ev["checks_tree"] = post.tree
+            ev["check_artifacts"] = sorted({c.path for c in artifacts})
             ev["executor"] = self._executor_evidence(result, limits("evidence_output_bytes"))
             ev["new_branch"] = new_branch
             ev["run_kind"] = kind

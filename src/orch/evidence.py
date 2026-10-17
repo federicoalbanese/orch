@@ -84,9 +84,15 @@ class FileChange:
     deleted: int | None = None
 
 
-def diff_trees(root: Path, before: str, after: str, max_patch: int) -> tuple[list[FileChange], str, bool]:
+def diff_trees(
+    root: Path, before: str, after: str, max_patch: int, paths: list[str] | None = None
+) -> tuple[list[FileChange], str, bool]:
+    """Changes between two trees, optionally limited to `paths` (an empty list means no paths at all)."""
+    if paths is not None and not paths:
+        return [], "", False
+    spec = ["--", *paths] if paths else []
     changes: list[FileChange] = []
-    out = _git(root, "diff", "--name-status", "-M", "-z", "--no-color", before, after)
+    out = _git(root, "diff", "--name-status", "-M", "-z", "--no-color", before, after, *spec)
     parts = [p for p in out.split("\0") if p != ""]
     i = 0
     while i < len(parts):
@@ -97,7 +103,7 @@ def diff_trees(root: Path, before: str, after: str, max_patch: int) -> tuple[lis
         else:
             changes.append(FileChange(status[0], parts[i + 1]))
             i += 2
-    stats = _git(root, "diff", "--numstat", "-M", "-z", before, after)
+    stats = _git(root, "diff", "--numstat", "-M", "-z", before, after, *spec)
     by_path = {c.path: c for c in changes}
     fields = stats.split("\0")
     j = 0
@@ -115,7 +121,7 @@ def diff_trees(root: Path, before: str, after: str, max_patch: int) -> tuple[lis
             c.added = int(added) if added.isdigit() else None
             c.deleted = int(deleted) if deleted.isdigit() else None
         j += 1
-    patch = _git(root, "diff", "-M", "--no-color", "--no-ext-diff", before, after)
+    patch = _git(root, "diff", "-M", "--no-color", "--no-ext-diff", before, after, *spec)
     patch, truncated = truncate_middle(redact(patch), max_patch)
     return changes, patch, truncated
 
@@ -200,12 +206,20 @@ def collect(
     spec: TaskSpec,
     cfg: Config,
     report: dict[str, Any] | None,
+    prior_paths: set[str] | None = None,
 ) -> dict[str, Any]:
-    """Compare the tree after a run with the task's baseline (cumulative) and the run's start (this attempt)."""
+    """Compare the tree after a run with the task's baseline (cumulative) and the run's start (this attempt).
+
+    Only paths the executor touched during one of this task's attempts are attributed
+    to it (`prior_paths` holds those of earlier attempts). Files created between
+    attempts, such as artifacts of the engine's own check runs, are not.
+    """
     after = snapshot(root)
     max_patch = cfg.get("limits", "evidence_output_bytes") * 3
-    changes, patch, truncated = diff_trees(root, baseline, after.tree, max_patch)
     attempt_changes, _, _ = diff_trees(root, before.tree, after.tree, 1000)
+    attempt_paths = {c.path for c in attempt_changes} | {c.old_path for c in attempt_changes if c.old_path}
+    executor_paths = sorted(set(prior_paths or ()) | attempt_paths)
+    changes, patch, truncated = diff_trees(root, baseline, after.tree, max_patch, executor_paths)
     changed = sorted({c.path for c in changes} | {c.old_path for c in changes if c.old_path})
     violations = [p for p in changed
                   if not globs.match_any(p, spec.scope.allow) or globs.match_any(p, spec.scope.deny)]
@@ -236,7 +250,7 @@ def collect(
         "before": asdict(before),
         "after": asdict(after),
         "changes": [asdict(c) for c in changes],
-        "attempt_changed_files": sorted(c.path for c in attempt_changes),
+        "attempt_changed_files": sorted(attempt_paths),
         "changed_files": changed,
         "lines_added": sum(c.added or 0 for c in changes),
         "lines_deleted": deleted_lines,

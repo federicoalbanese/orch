@@ -538,20 +538,40 @@ class Store:
         ).fetchone()
         return {**dict(row), "data": json.loads(row["data"])} if row else None
 
-    def approved_changes(self, project_id: str) -> dict[str, str]:
-        """path -> tree id holding the content an APPROVED task left it in (latest approval wins)."""
+    def task_evidence(self, task_id: str) -> list[dict[str, Any]]:
         rows = self.conn.execute(
-            "SELECT e.data FROM evidence e JOIN runs r ON r.id = e.run_id JOIN tasks t ON t.id = r.task_id"
-            " WHERE t.project_id = ? AND t.status = 'APPROVED'"
-            " AND e.id = (SELECT MAX(e2.id) FROM evidence e2 JOIN runs r2 ON r2.id = e2.run_id WHERE r2.task_id = t.id)"
-            " ORDER BY e.id",
+            "SELECT e.data FROM evidence e JOIN runs r ON r.id = e.run_id WHERE r.task_id = ? ORDER BY e.id",
+            (task_id,),
+        ).fetchall()
+        return [json.loads(r["data"]) for r in rows]
+
+    def approved_changes(self, project_id: str) -> dict[str, str]:
+        """path -> tree id holding the content an APPROVED task left it in (latest approval wins).
+
+        Covers the files the executor changed and every file the engine's checks created
+        during any of the task's attempts, at the state recorded by its last evidence.
+        """
+        rows = self.conn.execute(
+            "SELECT r.task_id, e.data FROM evidence e JOIN runs r ON r.id = e.run_id"
+            " JOIN tasks t ON t.id = r.task_id WHERE t.project_id = ? AND t.status = 'APPROVED' ORDER BY e.id",
             (project_id,),
         ).fetchall()
-        out: dict[str, str] = {}
+        per_task: dict[str, tuple[dict[str, Any], set[str]]] = {}
+        order: list[str] = []
         for row in rows:
             data = json.loads(row["data"])
-            for path in data.get("changed_files", []):
-                out[path] = data["after"]["tree"]
+            _, artifacts = per_task.get(row["task_id"], ({}, set()))
+            artifacts |= set(data.get("check_artifacts", []))
+            if row["task_id"] in per_task:
+                order.remove(row["task_id"])
+            order.append(row["task_id"])
+            per_task[row["task_id"]] = (data, artifacts)
+        out: dict[str, str] = {}
+        for task_id in order:  # tasks whose latest evidence is newer win
+            data, artifacts = per_task[task_id]
+            tree = data.get("checks_tree") or data["after"]["tree"]
+            for path in set(data.get("changed_files", [])) | artifacts:
+                out[path] = tree
         return out
 
     def insert_review(self, task_id: str, attempt: int, decision: str, data: dict[str, Any], reviewer: str) -> int:

@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.3.1 (2026-10-17)
+
+**Fixed**
+- Files created by the engine's own check runs (for example Python's `__pycache__/`, logs, coverage output) were attributed to the executor. They could show up as scope violations, block corrections, and block dependent tasks. Evidence now charges the executor only with what changed during its own attempts. The engine snapshots again after the checks, and lists those files separately as check artifacts.
+- The tests now run with bytecode writing enabled, as on a fresh CI runner, which is how this bug surfaced.
+
+**Changed**
+- CI uses `actions/checkout@v5` and `actions/setup-python@v6` (Node 24).
+
 ## 0.3.0 (2026-10-17)
 
 The first end-to-end release: Claude plans and reviews, Antigravity implements, orch referees.

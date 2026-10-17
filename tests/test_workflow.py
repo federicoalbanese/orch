@@ -106,7 +106,7 @@ def test_full_loop_with_a_correction_cycle(store, paths, cfg, calc):
 
 def test_auto_fix_loop_runs_without_review(store, paths, cfg, calc):
     (tid,) = import_tasks(store, cfg, calc, calc_task())
-    ex = FakeExecutor([FakeStep(files={"calc.py": "def add(a, b):\n    return a * b\n"}, report=DONE),
+    ex = FakeExecutor([FakeStep(files={"calc.py": "def add(a, b):\n    return a * b * 1\n"}, report=DONE),
                        FakeStep(files={"calc.py": GOOD}, report=DONE)])
     out = engine(store, paths, cfg, ex).dispatch(tid)
     assert out.status == "IN_REVIEW" and out.checks[0]["passed"]
@@ -379,3 +379,34 @@ def test_cumulative_usage_is_recorded_per_run(store, paths, cfg, calc):
     eng.dispatch(tid)
     assert [r["usage"] for r in store.list_runs(tid)] == [{"input_tokens": 100}, {"input_tokens": 30}]
     assert review.build_bundle(store, cfg, tid)["usage_total"] == {"input_tokens": 130}
+
+
+ARTIFACT_CHECK = ("python3 -c \"import calc, os; assert calc.add(2, 3) == 5; os.makedirs('cache', exist_ok=True); "
+                  "open('cache/check.log', 'w').write('ran')\"")
+
+
+def test_check_artifacts_are_not_attributed_to_the_executor(store, paths, cfg, calc):
+    registry.set_command(store, calc.id, "test", ARTIFACT_CHECK, "user", confirm=True)
+    t1, t2 = import_tasks(store, cfg, calc, calc_task("T1"),
+                          calc_task("T2", depends_on=["T1"], scope={"allow": ["calc.py", "cache/**"]}))
+    ex = FakeExecutor({
+        t1: [FakeStep(files={"calc.py": GOOD}, report=DONE),
+             FakeStep(files={"test_calc.py": "x = 1\n"}, report={**DONE, "files_changed": ["test_calc.py"]})],
+        t2: [FakeStep(files={"calc.py": GOOD + "# t2\n"}, report=DONE)],
+    })
+    eng = engine(store, paths, cfg, ex)
+    eng.dispatch(t1)
+    ev = review.build_bundle(store, cfg, t1)["evidence"]
+    assert ev["changed_files"] == ["calc.py"] and ev["scope_violations"] == []
+    assert "cache/check.log" in ev["check_artifacts"]
+    assert any(a.startswith("__pycache__/") for a in ev["check_artifacts"])
+
+    review.decide(store, cfg, t1, review_doc("NEEDS_CORRECTION", findings=[
+        {"severity": "minor", "category": "tests", "message": "m", "instruction": "add a test"}]), "claude")
+    assert eng.dispatch(t1).status == "IN_REVIEW"  # the artifacts do not block the correction
+    ev = review.build_bundle(store, cfg, t1)["evidence"]
+    assert ev["changed_files"] == ["calc.py", "test_calc.py"] and ev["scope_violations"] == []
+    review.decide(store, cfg, t1, review_doc("APPROVED"), "claude")
+
+    assert eng.dispatch(t2).status == "IN_REVIEW"  # nor the dependent task, whose scope covers cache/
+    assert review.build_bundle(store, cfg, t2)["evidence"]["changed_files"] == ["calc.py"]
