@@ -1,6 +1,6 @@
 # orch architecture
 
-Status: Phases 1 to 4 are implemented. Phase 3 was validated live with `agy` ([validation-phase3.md](validation-phase3.md)). Phases 5 and 6 are planned.
+Status: Phases 1 to 5 are implemented. Phase 3 was validated live with `agy` on a sample repository ([validation-phase3.md](validation-phase3.md)), and Phase 5 on a real production repository ([validation-phase5.md](validation-phase5.md)). Phase 6 is planned.
 
 Every capability claim below was verified by probing the real tools (section 2), not assumed.
 
@@ -75,6 +75,7 @@ all hosted on self-hosted GitLab rather than GitHub. Three facts follow:
 - **Latency varies widely.** A trivial resumed turn took 60 s, while a fresh one took 3 s. Timeouts must be generous and progress has to come from streaming.
 - **Reports use absolute paths** and `file://` markdown links, so the engine normalizes them.
 - **Code goes to Google.** Every task sends source code to Google's servers. Employer or client repositories may forbid that, so projects are **opt-in** for external execution (R3).
+- **`agy` reads more than tracked code.** A task's scope limits what `agy` may change, not what it may read, and gitignored files such as `.env` are in the working tree too. orch names the sensitive ones at opt-in, in `orch project show`, and at every dispatch (R3).
 
 ### 2.3 Claude side
 
@@ -137,7 +138,7 @@ all hosted on self-hosted GitLab rather than GitHub. Three facts follow:
 - **Plan:** objective, context summary, decision plus rationale and trade-offs (flagged when architectural), risks, unknowns, tasks.
 - **Task:** `key`, objective, `scope.allow` and `scope.deny` path globs, relevant files, instructions, `acceptance[]` (each with `id`, text, and `verify` as a command or `review`), required checks, `risk` (low/medium/high), `depends_on[]`, deliverables.
 - **Run:** task, attempt, kind (`execute`, `correction`, `auto_fix`, `retry`), executor, conversation id, timing, status and classification, usage, transcript path, before and after tree ids.
-- **Evidence:** the diff since the task started and the diff of this attempt, changed files, scope violations, policy flags, results of each verification command (exit code, duration, truncated and redacted output), the executor's report, and discrepancies between the claimed and the actual diff.
+- **Evidence:** the diff since the task started and the diff of this attempt (both shown in the review bundle when they differ), changed files, scope violations, policy flags, results of each verification command (exit code, duration, truncated and redacted output), the executor's report, and discrepancies between the claimed and the actual diff.
 - **Review:** decision (`APPROVED`, `NEEDS_CORRECTION`, `BLOCKED`, `NEEDS_HUMAN_APPROVAL`), every acceptance criterion with `met` and evidence, and findings (severity, category, file and line, message, actionable instruction).
 
 ### 3.4 Task state machine
@@ -223,13 +224,13 @@ Rules:
 
 - **Preflight.** A task does not start if uncommitted changes in its scope would be attributed to the executor. Changes that byte-match what an approved task produced don't count, so dependent tasks can build on approved work before it is committed. Later runs of the same task compare against its own last snapshot.
 - **Snapshots.** The whole working tree is recorded through a temporary git index (`read-tree`, `add -A`, `write-tree`). The user's index, files and branches are never touched.
-- **Branching.** Work that would start on a protected branch moves first to `orch/P<n>` (`git switch -c`, which keeps uncommitted work).
+- **Branching.** Work that would start on a protected branch moves first to `orch/P<n>` (`git switch -c`, which keeps uncommitted work). A project's own default branch always counts as protected, whatever it is called, so a repository that integrates on `develop` is covered too.
 - **Commits.** `orch task commit <task>...` commits approved tasks after the user's OK (policy action `git_commit`; refused for Claude unless the policy makes it automatic). `--dry-run` shows the files and the message without committing.
   - **Exactly the task's files.** It commits the files the evidence attributes to the executor, never check artifacts, other uncommitted work, or anything already staged in the user's index (`git commit --only`).
   - **Only reviewed content.** Each file must still hold its approved content. A file changed again by a later approved task needs both tasks in one commit.
   - **Literal paths.** File names are never treated as patterns.
   - **Protected branches.** Committing on one is refused.
-  - **The message.** It is built from the task spec and the engine's evidence, with `Orch-Task:` trailers. orch never adds `Co-Authored-By` trailers, and it removes any from a message it is given.
+  - **The message.** It is built from the task spec and the engine's evidence, with `Orch-Task:` trailers, or taken from `--message-file`. When the repository's recent subjects use Conventional Commits types and the message doesn't, the plan carries a note. orch never adds `Co-Authored-By` trailers, and it removes any from a message it is given.
   - **Never pushes.** Pushing, MRs and merges stay with the user.
 - **Concurrency.** One task per repository working tree by default. Parallelism happens across repositories.
 
@@ -255,7 +256,7 @@ Rules:
 | 2 Core | Schemas and models, SQLite store with migrations, config and policy, project registry and stack discovery, executor interface, CLI, unit tests | ✅ |
 | 3 First end-to-end | `agy` adapter, evidence collector, review and correction loop, auto-fix, scheduler, cancellation, recovery, manual fallback, Claude Code skill; validated live | ✅ |
 | 4 Reliability and safety | Deeper `orch doctor` (version check, `--probe` account check), commits with approval, failure-injection tests (killed engine, real cancellation, retry exhaustion, corrupted output), scoped `agy` command grants evaluated ([findings](agy-command-grants.md)) | ✅ |
-| 5 Multi-project | Several real repositories of different stacks, each opted in deliberately | Planned |
+| 5 Real repositories | A live run on a real production repository (CodeIgniter and Vue, PHP only in Docker, no test suite), opted in deliberately; six defects fixed ([validation](validation-phase5.md)). Go, Python and Node remain to be validated live | ✅ |
 | 6 Optimization | Headless `claude -p` mode, worktree parallelism, context compaction, usage reports, dashboard | Planned |
 
 ---
@@ -266,7 +267,7 @@ Rules:
 |---|---|---|
 | R1 | An `agy` self-update changes its CLI or output | The adapter isolates it and parses defensively; contract tests replay recorded and corrupted output; `orch doctor` warns when the version differs from the verified one |
 | R2 | The Google account is rate-limited, unlicensed, or not eligible (429/403/400) | Back off on 429; classify the others as `ENV_BLOCKED` and escalate; nothing is half-applied; `orch doctor --probe` checks the account on request |
-| R3 | **Employer or client source code is sent to Google** | `allow_external_engine` is off by default per project; only a person can opt a project in |
+| R3 | **Employer or client source code is sent to Google** | `allow_external_engine` is off by default per project; only a person can opt a project in. Sensitive files outside git, which `agy` can still read, are named at opt-in and at every dispatch |
 | R4 | `agy` can't run tests itself, so it iterates more slowly | Engine-run verification plus the auto-fix loop. Scoped grants work headless, but they are prefix-wide, outlive tasks and bypass `agy`'s sandbox, so orch does not use them ([findings](agy-command-grants.md)) |
 | R5 | Docker-based tests need running containers and are slow | Per-command `requires_services` and generous timeouts; starting services needs approval |
 | R6 | The executor edits outside scope or refactors unrelated code | Snapshot plus scope check: violations block approval and auto-fix. The engine never reverts work automatically |

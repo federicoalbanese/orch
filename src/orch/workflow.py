@@ -194,6 +194,11 @@ class Engine:
 
         executor = self.executor_factory(executor_name)
         caps = executor.capabilities()
+        secrets = evidence.readable_secrets(root, pcfg) if caps.sends_code_off_machine else []
+        if secrets:
+            self.store.add_event("policy.secrets_readable", "task", task_id, "engine", project.id, {"paths": secrets})
+            self.progress(task_id, {"event": "warning", "message": f"{executor_name} can read sensitive files that "
+                                    f"git doesn't track: {', '.join(secrets)}"})
         limits = lambda key: pcfg.get("limits", key)  # noqa: E731
         model = task.spec.model or project.model or pcfg.get("executor", "model")
         checks = evidence.check_names(task.spec)

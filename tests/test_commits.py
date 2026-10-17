@@ -127,6 +127,17 @@ def test_refused_on_a_protected_branch(store, paths, cfg, calc):
         commits.create(store, cfg, [tid], "user")
 
 
+def test_refused_on_the_projects_own_default_branch(store, paths, cfg, calc):
+    """Found on a real repository whose integration branch is `develop`, which no default pattern names."""
+    root = Path(calc.root)
+    (tid,) = import_tasks(store, cfg, calc, calc_task())
+    approve(store, paths, cfg, tid, {"calc.py": GOOD})
+    git(root, "branch", "-q", "-m", "work", "develop")
+    registry.set_field(store, calc.id, "default_branch", "develop", "user")
+    with pytest.raises(PolicyError, match="protected branch 'develop'"):
+        commits.create(store, cfg, [tid], "user")
+
+
 def test_given_messages_lose_attribution_trailers(store, paths, cfg, calc):
     (tid,) = import_tasks(store, cfg, calc, calc_task())
     approve(store, paths, cfg, tid, {"calc.py": GOOD})
@@ -180,14 +191,31 @@ def test_cli_commit(tmp_path, capsys, store, paths, cfg, calc, monkeypatch):
     assert main(["--home", home, "task", "commit", tid, "--dry-run"]) == 0
     out = capsys.readouterr().out
     assert "Would commit 1 file(s) on work" in out and "calc.py" in out and "Orch-Task: P1.T1" in out
+    message = tmp_path / "msg.txt"
+    message.write_text("Make add() add\n")
+    assert main(["--home", home, "task", "commit", tid, "--dry-run", "--message-file", str(message)]) == 0
+    assert f"To commit: orch task commit {tid} --message-file {message}" in capsys.readouterr().out
     assert main(["--home", home, "task", "commit", tid]) == 5
     assert "must be done by the user" in capsys.readouterr().err
     monkeypatch.delenv("ORCH_ACTOR")
-    message = tmp_path / "msg.txt"
-    message.write_text("Make add() add\n")
     assert main(["--home", home, "--json", "task", "commit", tid, "--message-file", str(message)]) == 0
     data = json.loads(capsys.readouterr().out)
     assert data["committed_files"] == ["calc.py"] and data["message"] == "Make add() add\n"
     assert data["commit"] == head(Path(calc.root))
     assert subprocess.run(["git", "log", "-1", "--format=%s"], cwd=calc.root, capture_output=True,
                           text=True).stdout.strip() == "Make add() add"
+
+
+def test_a_note_when_the_repository_uses_conventional_commits(store, paths, cfg, calc):
+    """Found on a real repository whose subjects are `fix: ...`: orch's generated subject had no type."""
+    root = Path(calc.root)
+    (tid,) = import_tasks(store, cfg, calc, calc_task())
+    approve(store, paths, cfg, tid, {"calc.py": GOOD})
+    assert commits.prepare(store, cfg, [tid]).notes == []  # one "initial" commit: no convention to follow
+    for n in range(5):
+        (root / "README.md").write_text(f"# calc {n}\n")
+        git(root, "commit", "-q", "-m", f"docs: revise the readme ({n})", "--", "README.md")
+    plan = commits.prepare(store, cfg, [tid])
+    assert len(plan.notes) == 1 and "5 of the last 6 commit subjects" in plan.notes[0]
+    assert commits.prepare(store, cfg, [tid], "fix: make add() add\n").notes == []
+    assert commits.prepare(store, cfg, [tid], "Make add() add\n").notes == plan.notes

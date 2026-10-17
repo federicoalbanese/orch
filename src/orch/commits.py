@@ -33,6 +33,7 @@ SUBJECT_MAX = 72
 WIDTH = 72
 HOOK_TIMEOUT = 600.0
 _ATTRIBUTION = re.compile(r"^\s*co-authored-by\s*:", re.I)
+_CONVENTIONAL = re.compile(r"^(feat|fix|docs|style|refactor|perf|test|tests|build|ci|chore|revert)(\([^)]*\))?!?: \S")
 _ENV = {**gitutil._GIT_ENV, "GIT_LITERAL_PATHSPECS": "1"}
 
 
@@ -46,6 +47,7 @@ class CommitPlan:
     already_committed: list[str]     # attributed files that already match HEAD
     message: str
     committed_files: list[str] = field(default_factory=list)
+    notes: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -115,6 +117,18 @@ def build_message(tasks: list[Task], evidences: dict[str, dict[str, Any]], plan_
     return strip_attribution("\n".join(lines))
 
 
+def convention_note(root: Path, message: str) -> str | None:
+    """A note when the repository's recent subjects use Conventional Commits types and this message doesn't."""
+    rc, out = gitutil.run_git(root, "log", "-20", "--no-merges", "--format=%s")
+    subjects = out.splitlines() if rc == 0 else []
+    typed = sum(1 for s in subjects if _CONVENTIONAL.match(s))
+    subject = message.strip().splitlines()[0] if message.strip() else ""
+    if len(subjects) < 5 or typed * 2 <= len(subjects) or _CONVENTIONAL.match(subject):
+        return None
+    return (f"{typed} of the last {len(subjects)} commit subjects here start with a Conventional Commits type "
+            "(fix:, feat:, ...) and this one doesn't; pass --message-file to match the repository's convention")
+
+
 def _load(store: Store, cfg: Config, task_ids: list[str]) -> tuple[list[Task], Any, Config]:
     if not task_ids:
         raise ValidationError("name at least one task")
@@ -180,8 +194,10 @@ def prepare(store: Store, cfg: Config, task_ids: list[str], message: str | None 
     else:
         titles = {t.plan_id: store.get_plan(t.plan_id)["title"] for t in tasks}
         message = build_message(tasks, evidences, titles)
+    note = convention_note(root, message)
     return CommitPlan(project_id=project.id, root=str(root), branch=branch, tasks=[t.id for t in tasks],
-                      files=to_commit, already_committed=sorted(set(files) - set(to_commit)), message=message)
+                      files=to_commit, already_committed=sorted(set(files) - set(to_commit)), message=message,
+                      notes=[note] if note else [])
 
 
 def create(store: Store, cfg: Config, task_ids: list[str], actor: str, message: str | None = None) -> tuple[CommitPlan, str]:

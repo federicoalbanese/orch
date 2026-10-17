@@ -36,6 +36,7 @@ you need to parse output. Data contracts: `orch schema plan|review|report`.
    - Run `orch project add <path>`.
    - Ask the user to fix commands where needed (`orch project command set ...`), then confirm them with `orch project command confirm <id>`.
 3. **Make sure the project is opted in to agy.** If not, explain that every task sends this repository's code to Google through `agy`, and that employer or client code may be restricted. Then ask the user to run `orch project engine <id> --allow`, or to keep the work local.
+   - `agy` can read every file in the working tree, not only tracked code. If `orch project show <id>` lists sensitive files under `outside git` (a gitignored `.env`, for example), ask the user to move them out of the tree while tasks run, and to put them back afterwards.
 4. **Read the project context:** `orch context show <id>`. If `context.md` is still the template, offer to fill it in after inspecting the repo.
 
 ## 1. Understand and inspect
@@ -78,7 +79,7 @@ Run `orch run --project <id>`.
 
 1. **Read the bundle.** Run `orch review show <task>`. It contains:
    - what blocks approval,
-   - the diff,
+   - the diff since the task started, and, after a correction or auto-fix, this attempt's own diff,
    - the real check output,
    - scope violations, policy flags, and discrepancies with the executor's claims,
    - earlier reviews.
@@ -118,8 +119,8 @@ When all tasks are APPROVED:
    - **Prepare the commit.** Run `orch task commit <task>... --dry-run` and show the user the files and the message.
      - It commits only the tasks' own reviewed files.
      - A file changed again by a later approved task needs both tasks in one commit; the refusal names them.
-     - For your own wording, pass `--message-file`. Never add `Co-Authored-By` or other attribution lines; orch strips `Co-Authored-By` anyway.
-   - **The user commits.** Ask them to run `orch task commit <task>...` themselves.
+     - Match the repository's commit convention: read `git log`, and when the generated message doesn't fit (the dry run prints a `Note` when recent subjects use `fix:`/`feat:` types), write one in its style and pass `--message-file`. Never add `Co-Authored-By` or other attribution lines; orch strips `Co-Authored-By` anyway.
+   - **The user commits.** Ask them to run the `To commit:` line of the dry run themselves; it repeats any `--message-file`.
    - **Never push or open MRs.** Leave that to the user.
 
 ## When things fail

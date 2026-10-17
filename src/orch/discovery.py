@@ -124,6 +124,54 @@ def parse_makefile(text: str) -> dict[str, list[str]]:
     return targets
 
 
+def parse_make_variables(text: str) -> dict[str, str]:
+    """Simple top-level variable assignments (`NAME = value`, `:=`, `?=`), first one wins.
+
+    A heuristic, like parse_makefile: no includes, conditionals or functions.
+    """
+    variables: dict[str, str] = {}
+    for line in text.splitlines():
+        if line.startswith("\t"):
+            continue
+        m = re.match(r"^\s*(?:export\s+|override\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*(?::{1,3}|\?|\+)?=\s*(.*?)\s*$", line)
+        if m:
+            variables.setdefault(m.group(1), m.group(2))
+    return variables
+
+
+def expand_make(text: str, variables: dict[str, str], depth: int = 5) -> str:
+    """Expand `$(NAME)` and `${NAME}` references to known variables; unknown ones are left as they are."""
+    for _ in range(depth):
+        new = re.sub(r"\$[({]([A-Za-z_][A-Za-z0-9_]*)[)}]", lambda m: variables.get(m.group(1), m.group(0)), text)
+        if new == text:
+            break
+        text = new
+    return text
+
+
+_CONTAINER_TOOLS = {"docker", "docker-compose", "podman", "podman-compose", "sail"}
+_CONTAINER_LIFECYCLE = {"build", "up", "down", "pull", "push", "rm", "stop", "start", "restart", "kill", "create"}
+_CONTAINER_OPTS_WITH_VALUE = {"-f", "--file", "-p", "--project-name", "--profile", "--env-file", "--project-directory"}
+
+
+def container_subcommands(recipe: str) -> list[str]:
+    """The subcommands of container tools in a recipe: `docker compose -f x.yml build` gives ["build"]."""
+    words = re.sub(r"&&|\|\||[;|]", " ", recipe).split()
+    found: list[str] = []
+    for i, word in enumerate(words):
+        tool = word.lstrip("@-(")
+        if tool not in _CONTAINER_TOOLS:
+            continue
+        j = i + 1
+        if tool in ("docker", "podman") and j < len(words) and words[j] == "compose":
+            j += 1
+        while j < len(words) and words[j].startswith("-"):
+            j += 2 if words[j] in _CONTAINER_OPTS_WITH_VALUE else 1
+        if j < len(words):
+            found.append(words[j])
+    return found
+
+
 def parse_compose_services(text: str) -> list[str]:
     """Top-level service names from a compose file (indentation-based, no YAML library needed)."""
     services: list[str] = []
@@ -255,13 +303,21 @@ class _Discovery:
         if not name:
             return
         self.r.markers.append(name)
-        targets = parse_makefile(_read_text(self.root / name) or "")
+        text = _read_text(self.root / name) or ""
+        targets = parse_makefile(text)
+        variables = parse_make_variables(text)
         self.r.makefile_targets = sorted(targets)
         for cmd, options in MAKE_TARGETS.items():
             for target in options:
                 if target in targets:
-                    recipe = " ".join(targets[target])
-                    services = bool(re.search(r"\bdocker\b|\bcompose\b|\bsail\b", recipe))
+                    recipe = expand_make(" ".join(targets[target]), variables)
+                    subs = container_subcommands(recipe)
+                    if subs and all(sub in _CONTAINER_LIFECYCLE for sub in subs):
+                        self.r.warnings.append(
+                            f"{name}:{target} only manages containers or images ({', '.join(dict.fromkeys(subs))}); "
+                            f"not proposed as the {cmd} command")
+                        continue
+                    services = bool(subs) or bool(re.search(r"\b(docker|compose|sail|podman)\b", recipe, re.I))
                     self.candidate(cmd, f"make {target}", f"{name}:{target}", "high", services, priority=0)
                     break
 

@@ -12,6 +12,7 @@ from orch.discovery import DiscoveryReport, Which, discover
 from orch.errors import PolicyError, ValidationError
 from orch.models import Actor, Command, Project
 from orch.paths import Paths
+from orch.policy import is_protected_branch
 from orch.store import Store
 from orch.util import now
 
@@ -230,4 +231,14 @@ def archive_project(store: Store, project_id: str, actor: str) -> Project:
 
 
 def effective_config(cfg: Config, project: Project) -> Config:
-    return cfg.with_overrides(project.overrides, where=f"project {project.id}") if project.overrides else cfg
+    """The config for one project: its overrides applied, and its own default branch protected.
+
+    The default branch is where a team integrates, whatever it is called (`develop`
+    is common), so work never starts there and orch never commits there.
+    """
+    pcfg = cfg.with_overrides(project.overrides, where=f"project {project.id}") if project.overrides else cfg
+    branch = project.default_branch
+    if branch and not is_protected_branch(branch, pcfg):
+        protected = [*pcfg.get("policy", "protected_branches"), branch]
+        pcfg = pcfg.with_overrides({"policy": {"protected_branches": protected}}, where=f"project {project.id}")
+    return pcfg

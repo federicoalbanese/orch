@@ -151,6 +151,10 @@ orch log --task P1.T1                    # audit trail
 
 **Projects are opt-in.** Every Antigravity task sends that repository's code to Google, so no project is enabled until you run `orch project engine <id> --allow`. Check your employer's or client's policy before opting in their code.
 
+**Antigravity can read files git ignores.** Its scope limits what it may change, not what it may read. `orch project engine --allow`, `orch project show` and every dispatch name the sensitive files outside git (a `.env`, keys). Move them out of the repository while tasks run.
+
+**Your default branch is protected**, whatever it is called (`develop`, for example). Work moves to a local `orch/P<n>` branch before Antigravity edits anything.
+
 ## Commands
 
 | Command | Purpose |
@@ -200,7 +204,11 @@ orch project override shop limits.max_review_cycles 5
 
 ## Status and limitations
 
-orch is **alpha**. Phases 1 to 4 are done. Phase 3 was [validated live](docs/validation-phase3.md) on a sample repository, where Claude sent back one correction per task and approved both. Phase 4 hardened the engine against killed engines, cancelled processes, exhausted retries and corrupted executor output.
+orch is **alpha**. Phases 1 to 5 are done.
+
+- **Phase 3** was [validated live](docs/validation-phase3.md) on a sample repository, where Claude sent back one correction per task and approved both.
+- **Phase 4** hardened the engine against killed engines, cancelled processes, exhausted retries and corrupted executor output.
+- **Phase 5** [validated it on a real repository](docs/validation-phase5.md): a large CodeIgniter and Vue platform whose PHP runs only in Docker, with no test suite. One real bug fix took one correction and was approved, and the run exposed six defects, now fixed.
 
 Known limitations:
 
@@ -210,7 +218,7 @@ Known limitations:
 - **Untested on Windows.**
 
 Roadmap:
-- **Phase 5:** multi-repository validation.
+- **More stacks, live:** Go, Python and Node repositories are discovered and covered by tests, but haven't been validated live yet.
 - **Phase 6:** an unattended mode with headless Claude, worktree parallelism, and a dashboard.
 
 Details are in [docs/architecture.md](docs/architecture.md).
@@ -219,6 +227,7 @@ Details are in [docs/architecture.md](docs/architecture.md).
 
 - [Architecture](docs/architecture.md): design, verified integration facts, state machine, policy, risks
 - [Phase 3 validation](docs/validation-phase3.md): a full live run, with every defect it exposed
+- [Phase 5 validation](docs/validation-phase5.md): a real production repository, with timings, tokens and the defects it exposed
 - [Scoped `agy` command grants](docs/agy-command-grants.md): what exists, what was verified, and why orch doesn't use them yet
 - [Changelog](CHANGELOG.md) · [Contributing](CONTRIBUTING.md) · [Security](SECURITY.md)
 

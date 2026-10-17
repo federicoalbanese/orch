@@ -1,5 +1,25 @@
 # Changelog
 
+## 0.5.0 (2026-10-17)
+
+Validated on a real repository (Phase 5): a large CodeIgniter and Vue platform whose PHP runs only in Docker, with no test suite. One real bug fix went through plan, dispatch, review, one correction and approval. See [docs/validation-phase5.md](docs/validation-phase5.md).
+
+**Fixed** (found by the run)
+- **Default branches are protected.** A project's own default branch counts as protected, whatever it is called. A repository that integrates on `develop` was not covered by `protected_branches`, so `agy` would have edited `develop` directly. Work now moves to `orch/P<n>` first, and `orch task commit` refuses the default branch.
+- **Discovery reads Make variables.** A Makefile target that only manages containers or images (`docker compose build`, `up`, `down`, ...) is no longer proposed as a check. `make build` wrapping `$(COMPOSE) build` had been proposed with high confidence as the build command. Discovery expands simple Make variables, so a recipe that reaches Docker through them is marked as needing services.
+- **Secrets outside git are named.** `agy` can read any file in the working tree, including gitignored ones like a `.env` with live credentials, and orch said nothing about it.
+  - `orch project engine --allow` now warns with the list of sensitive files outside git.
+  - `orch project show` lists them.
+  - Every dispatch to an executor that sends code off the machine records a `policy.secrets_readable` event and prints a warning.
+- **Corrections show their own diff.** Evidence stores each attempt's patch, and `orch review show` shows "This attempt's diff" before the cumulative one. Before, a correction's review only showed the diff since the task started.
+- **Commit messages follow the repository.** `orch task commit --dry-run` adds a note when recent subjects use Conventional Commits types (`fix:`, `feat:`) and the message doesn't. Its `To commit:` hint now repeats `--message-file`, which it used to drop.
+
+**Changed**
+- The `orchestrate` skill:
+  - asks the user to move sensitive files out of the tree while tasks run;
+  - reads the per-attempt diff when reviewing a correction;
+  - writes commit messages in the repository's own style.
+
 ## 0.4.0 (2026-10-17)
 
 Reliability and safety (Phase 4).

@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shlex
 import shutil
 import sqlite3
 import sys
@@ -18,7 +19,7 @@ from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
-from orch import __version__, commits, context, executors, plans, registry, review, skill, workflow
+from orch import __version__, commits, context, evidence, executors, plans, registry, review, skill, workflow
 from orch.config import ACTIONS, NEVER_AUTOMATIC, Config, default_config_text, load_config
 from orch.discovery import DiscoveryReport, discover
 from orch.errors import NotFoundError, OrchError, ValidationError
@@ -124,7 +125,7 @@ def render_discovery(r: DiscoveryReport) -> str:
     return "\n".join(lines)
 
 
-def render_project(p: Project, counts: dict[str, int], knowledge_dir: Path) -> str:
+def render_project(p: Project, counts: dict[str, int], knowledge_dir: Path, secrets: list[str]) -> str:
     lines = [
         f"{p.id}  ({p.name}){'  [archived]' if p.archived else ''}",
         f"  root:             {p.root}",
@@ -137,8 +138,10 @@ def render_project(p: Project, counts: dict[str, int], knowledge_dir: Path) -> s
         f"  knowledge:        {knowledge_dir}",
         f"  description:      {p.description or '-'}",
         f"  tasks:            {', '.join(f'{k}={v}' for k, v in sorted(counts.items())) or 'none'}",
-        "",
     ]
+    if secrets:
+        lines.append(f"  outside git:      {', '.join(secrets)} (sensitive; an executor can still read them)")
+    lines.append("")
     rows = [[n, c.run, "yes" if c.confirmed else "NO", c.confidence, c.timeout_seconds,
              "yes" if c.requires_services else "", c.source] for n, c in sorted(p.commands.items())]
     lines.append(table(rows, ["command", "run", "confirmed", "confidence", "timeout", "services", "source"])
@@ -315,8 +318,10 @@ def cmd_project(app: App) -> int:
     elif sub == "show":
         p = s.get_project(a.id)
         counts = s.task_counts().get(p.id, {})
-        app.out({**p.to_dict(), "task_counts": counts, "knowledge_dir": str(app.paths.project_dir(p.id))},
-                lambda: render_project(p, counts, app.paths.project_dir(p.id)))
+        secrets = evidence.readable_secrets(Path(p.root), registry.effective_config(app.config, p))
+        app.out({**p.to_dict(), "task_counts": counts, "knowledge_dir": str(app.paths.project_dir(p.id)),
+                 "readable_secrets": secrets},
+                lambda: render_project(p, counts, app.paths.project_dir(p.id), secrets))
     elif sub == "refresh":
         p, _, changes = registry.refresh_project(s, app.paths, a.id, app.actor)
         app.out({"project": p.to_dict(), "changes": changes},
@@ -342,7 +347,12 @@ def cmd_project(app: App) -> int:
                     else f"{a.id}: no commands to confirm (add one with: orch project command set)")
     elif sub == "engine":
         p = registry.set_engine(s, a.id, a.allow, app.actor)
-        app.out(p.to_dict(), f"{a.id}: external engine {'ALLOWED' if a.allow else 'not allowed'}")
+        secrets = evidence.readable_secrets(Path(p.root), registry.effective_config(app.config, p)) if a.allow else []
+        msg = f"{a.id}: external engine {'ALLOWED' if a.allow else 'not allowed'}"
+        if secrets:
+            msg += ("\nWarning: git doesn't track these sensitive files, but the executor can read them and send "
+                    f"them off this machine: {', '.join(secrets)}\nMove them out of {p.root} while tasks run.")
+        app.out({**p.to_dict(), "readable_secrets": secrets}, msg)
     elif sub == "archive":
         if not a.yes:
             raise ValidationError("archiving needs --yes")
@@ -418,14 +428,15 @@ def cmd_task(app: App) -> int:
             message = sys.stdin.read() if a.message_file == "-" else Path(a.message_file).read_text(encoding="utf-8")
         if a.dry_run:
             plan = commits.prepare(s, app.config, a.ids, message)
-            app.out({**plan.to_dict(), "dry_run": True}, lambda: render_commit(plan, None))
+            source = None if not a.message_file else "-" if a.message_file == "-" else str(Path(a.message_file).resolve())
+            app.out({**plan.to_dict(), "dry_run": True}, lambda: render_commit(plan, None, source))
         else:
             plan, sha = commits.create(s, app.config, a.ids, app.actor, message)
             app.out({**plan.to_dict(), "commit": sha}, lambda: render_commit(plan, sha))
     return 0
 
 
-def render_commit(plan: commits.CommitPlan, sha: str | None) -> str:
+def render_commit(plan: commits.CommitPlan, sha: str | None, message_file: str | None = None) -> str:
     if sha is None:
         lines = [f"Would commit {len(plan.files)} file(s) on {plan.branch} (dry run, nothing changed):"]
     else:
@@ -434,8 +445,10 @@ def render_commit(plan: commits.CommitPlan, sha: str | None) -> str:
     if plan.already_committed:
         lines.append("Already committed, unchanged: " + ", ".join(plan.already_committed))
     lines += ["", "Message:", *[f"  {line}".rstrip() for line in plan.message.splitlines()], ""]
+    lines += [f"Note: {n}" for n in plan.notes]
     if sha is None:
-        lines.append(f"To commit: orch task commit {' '.join(plan.tasks)}  (needs the user unless policy makes "
+        given = f" --message-file {shlex.quote(message_file)}" if message_file else ""
+        lines.append(f"To commit: orch task commit {' '.join(plan.tasks)}{given}  (needs the user unless policy makes "
                      "git_commit automatic)")
     else:
         lines.append("Not pushed. Push the branch yourself when you are ready.")
@@ -457,6 +470,8 @@ def _progress_printer(app: App) -> workflow.ProgressCallback | None:
                   flush=True)
         elif kind == "result":
             print(f"{task_id}    executor: {e.get('status')}", flush=True)
+        elif kind == "warning":
+            print(f"{task_id}    warning: {e['message']}", flush=True)
 
     return show
 

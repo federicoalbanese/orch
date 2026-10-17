@@ -1,3 +1,4 @@
+import dataclasses
 import json
 import threading
 import time
@@ -5,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from orch import evidence, plans, registry, review, workflow
+from orch import evidence, plans, policy, registry, review, workflow
 from orch.errors import PolicyError, ValidationError
 from orch.executors.base import Classification, ExecStatus
 from orch.executors.fake import FakeExecutor, FakeStep
@@ -35,6 +36,7 @@ def test_full_loop_with_a_correction_cycle(store, paths, cfg, calc):
     assert ev["changed_files"] == ["calc.py"] and ev["scope_violations"] == [] and bundle["approval_blockers"] == []
     assert "-    return a - b" in ev["patch"] and "+    return a + b" in ev["patch"]
     assert "Checks run by the engine" in review.render_bundle(bundle)
+    assert "This attempt's diff" not in review.render_bundle(bundle)  # the first attempt is the whole diff
 
     with pytest.raises(PolicyError, match="criterion A2 is marked unmet"):
         review.decide(store, cfg, t1, review_doc("APPROVED", met=False), "claude")
@@ -54,6 +56,11 @@ def test_full_loop_with_a_correction_cycle(store, paths, cfg, calc):
     ev = review.build_bundle(store, cfg, t1)["evidence"]
     assert ev["changed_files"] == ["calc.py", "test_calc.py"]  # cumulative since the task started
     assert ev["attempt_changed_files"] == ["test_calc.py"]
+    # The correction's own diff, so a reviewer can see what this attempt changed (found reviewing a real correction)
+    assert "+def test_add():" in ev["attempt_patch"] and "return a + b" not in ev["attempt_patch"]
+    rendered = review.render_bundle(review.build_bundle(store, cfg, t1))
+    assert "## This attempt's diff (correction" in rendered
+    assert rendered.index("## This attempt's diff") < rendered.index("## Diff since the task started")
 
     task, _ = review.decide(store, cfg, t1, review_doc("APPROVED"), "claude")
     assert task.status == TaskStatus.APPROVED and task.review_status == ReviewDecision.APPROVED
@@ -369,3 +376,45 @@ def test_check_artifacts_are_not_attributed_to_the_executor(store, paths, cfg, c
 
     assert eng.dispatch(t2).status == "IN_REVIEW"  # nor the dependent task, whose scope covers cache/
     assert review.build_bundle(store, cfg, t2)["evidence"]["changed_files"] == ["calc.py"]
+
+
+def test_work_moves_off_the_projects_own_default_branch(store, paths, cfg, calc):
+    """Found on a real repository whose integration branch is `develop`: agy would have edited it directly."""
+    root = Path(calc.root)
+    git(root, "branch", "-q", "-m", "work", "develop")
+    registry.set_field(store, calc.id, "default_branch", "develop", "user")
+    assert not policy.is_protected_branch("develop", cfg)
+    assert policy.is_protected_branch("develop", registry.effective_config(cfg, store.get_project(calc.id)))
+    (tid,) = import_tasks(store, cfg, calc, calc_task())
+    out = engine(store, paths, cfg, FakeExecutor([FakeStep(files={"calc.py": GOOD}, report=DONE)])).dispatch(tid)
+    assert out.status == "IN_REVIEW"
+    assert git(root, "branch", "--show-current") == "orch/P1"
+    assert git(root, "rev-parse", "develop") == git(root, "rev-parse", "orch/P1")  # nothing committed, just moved
+
+
+def test_sensitive_files_outside_git_are_reported(store, paths, cfg, calc):
+    """Found on a real repository: a gitignored .env with live credentials, readable by the executor."""
+    root = Path(calc.root)
+    (root / ".gitignore").write_text(".env\nsecrets/\nnotes/\n")
+    git(root, "add", ".gitignore")
+    git(root, "commit", "-q", "-m", "ignore")
+    (root / ".env").write_text("DB_PASSWORD=hunter2\n")
+    (root / "secrets").mkdir()
+    (root / "secrets" / "api.txt").write_text("token\n")
+    (root / "notes").mkdir()
+    (root / "notes" / "todo.txt").write_text("not sensitive\n")
+    (root / "scratch.txt").write_text("untracked, not sensitive\n")
+    assert evidence.readable_secrets(root, cfg) == [".env", "secrets/"]
+
+    class OffMachine(FakeExecutor):
+        def capabilities(self):
+            return dataclasses.replace(super().capabilities(), sends_code_off_machine=True)
+
+    seen = []
+    (tid,) = import_tasks(store, cfg, calc, calc_task())
+    eng = engine(store, paths, cfg, OffMachine([FakeStep(files={"calc.py": GOOD}, report=DONE)]),
+                 progress=lambda task_id, e: seen.append(e))
+    assert eng.dispatch(tid).status == "IN_REVIEW"
+    assert any(e.get("event") == "warning" and ".env, secrets/" in e["message"] for e in seen)
+    events = [e for e in store.list_events(subject_type="task", subject_id=tid) if e["kind"] == "policy.secrets_readable"]
+    assert events and events[0]["data"]["paths"] == [".env", "secrets/"]

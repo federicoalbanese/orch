@@ -62,6 +62,23 @@ def dirty_paths(root: Path) -> list[str]:
     return sorted(set(paths))
 
 
+def readable_secrets(root: Path, cfg: Config) -> list[str]:
+    """Files outside git (untracked or ignored) that match the sensitive globs.
+
+    An executor can read any file in the working tree, not only tracked code, so
+    opting a project in to an external engine can send these off the machine too
+    (a gitignored `.env`, for example). Snapshots honour .gitignore, so evidence
+    can't show these files either. Untracked and ignored directories are checked
+    as git reports them, collapsed (`secrets/`), not file by file.
+    """
+    rc, out = gitutil.run_git(root, "status", "--porcelain=v1", "-z", "--ignored", "--untracked-files=normal",
+                              strip=False)
+    if rc != 0:
+        return []
+    outside = [e[3:] for e in out.split("\0") if e[:3] in ("?? ", "!! ")]
+    return sorted(globs.matching(outside, cfg.get("policy", "sensitive_globs")))
+
+
 def snapshot(root: Path) -> Snapshot:
     if not gitutil.is_repo(root):
         raise OrchError(f"{root} is not a git repository; evidence collection needs git")
@@ -220,6 +237,7 @@ def collect(
     attempt_paths = {c.path for c in attempt_changes} | {c.old_path for c in attempt_changes if c.old_path}
     executor_paths = sorted(set(prior_paths or ()) | attempt_paths)
     changes, patch, truncated = diff_trees(root, baseline, after.tree, max_patch, executor_paths)
+    _, attempt_patch, attempt_truncated = diff_trees(root, before.tree, after.tree, max_patch, sorted(attempt_paths))
     changed = sorted({c.path for c in changes} | {c.old_path for c in changes if c.old_path})
     violations = [p for p in changed
                   if not globs.match_any(p, spec.scope.allow) or globs.match_any(p, spec.scope.deny)]
@@ -256,6 +274,8 @@ def collect(
         "lines_deleted": deleted_lines,
         "patch": patch,
         "patch_truncated": truncated,
+        "attempt_patch": attempt_patch,
+        "attempt_patch_truncated": attempt_truncated,
         "scope_violations": violations,
         "policy_flags": flags,
         "report": report,

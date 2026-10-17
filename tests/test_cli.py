@@ -122,3 +122,18 @@ def test_skill_install(tmp_path, capsys):
     assert "--force" in capsys.readouterr().err
     assert main(["--home", str(tmp_path), "skill", "install", "--dest", str(dest), "--force"]) == 0
     assert installed.read_text().startswith("---\nname: orchestrate")
+
+
+def test_opting_in_warns_about_sensitive_files_outside_git(tmp_path, capsys, make_repo, monkeypatch):
+    monkeypatch.delenv("ORCH_ACTOR", raising=False)
+    home = tmp_path / "home"
+    repo = make_repo("demo", {**PY_REPO, ".gitignore": ".env\n"})
+    (repo / ".env").write_text("APP_KEY=secret\n")
+    assert run(capsys, home, "project", "add", str(repo))[0] == 0
+    code, out, _ = run(capsys, home, "project", "engine", "demo", "--allow")
+    assert code == 0 and "external engine ALLOWED" in out
+    assert "the executor can read them and send them off this machine: .env" in out
+    code, out, _ = run(capsys, home, "project", "show", "demo")
+    assert "outside git:      .env" in out
+    code, out, _ = run(capsys, home, "--json", "project", "show", "demo")
+    assert json.loads(out)["readable_secrets"] == [".env"]

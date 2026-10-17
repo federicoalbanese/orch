@@ -1,6 +1,6 @@
 import json
 
-from orch.discovery import discover, parse_compose_services, parse_makefile
+from orch.discovery import container_subcommands, discover, expand_make, parse_compose_services, parse_make_variables, parse_makefile
 from orch.gitutil import sanitize_remote
 
 from conftest import all_tools, git, no_tools
@@ -96,3 +96,30 @@ def test_sanitize_remote_keeps_ssh():
     assert sanitize_remote("ssh://git@host:2222/a/b.git") == "ssh://git@host:2222/a/b.git"
     assert sanitize_remote("git@host:a/b.git") == "git@host:a/b.git"
     assert sanitize_remote("https://oauth2:tok@host/a.git") == "https://host/a.git"
+
+
+def test_make_variables_expand_and_container_tools_are_found():
+    text = "COMPOSE = docker compose\nFILES ?= -f docker-compose.yml -f docker-compose.$(ENV).yml\nENV := local\n"
+    variables = parse_make_variables(text)
+    assert expand_make("$(COMPOSE) ${FILES} build", variables) == \
+        "docker compose -f docker-compose.yml -f docker-compose.local.yml build"
+    assert expand_make("$(UNKNOWN) x", variables) == "$(UNKNOWN) x"
+    assert container_subcommands("docker compose -f a.yml --profile p build --pull") == ["build"]
+    assert container_subcommands("@docker-compose up -d && docker compose exec -T app pint") == ["up", "exec"]
+    assert container_subcommands("(cd web && npm run build)") == []
+
+
+def test_make_targets_that_only_manage_containers_are_not_proposed(make_repo):
+    """Found on a real CodeIgniter app: `make build` was `$(COMPOSE) $(COMPOSE_FILES) build`, an image rebuild."""
+    makefile = (
+        "COMPOSE = docker compose\nCOMPOSE_FILES = -f docker-compose.yml -f docker-compose.$(ENV).yml\n"
+        "build:\n\t@echo building\n\tAPP_ENV=$(ENV) $(COMPOSE) $(COMPOSE_FILES) build\n"
+        "test:\n\t$(COMPOSE) exec -T app vendor/bin/phpunit\n"
+        "lint:\n\t$(COMPOSE) up -d app && $(COMPOSE) exec -T app vendor/bin/pint --test\n"
+    )
+    r = discover(make_repo("ci3", {"Makefile": makefile, "docker-compose.yml": "services:\n  app:\n    build: .\n"}),
+                 which=all_tools)
+    assert "build" not in r.candidates
+    assert any("Makefile:build only manages containers or images (build)" in w for w in r.warnings)
+    assert r.candidates["test"][0].run == "make test" and r.candidates["test"][0].requires_services
+    assert r.candidates["lint"][0].run == "make lint" and r.candidates["lint"][0].requires_services
