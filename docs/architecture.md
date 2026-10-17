@@ -76,6 +76,7 @@ all hosted on self-hosted GitLab rather than GitHub. Three facts follow:
 - **Reports use absolute paths** and `file://` markdown links, so the engine normalizes them.
 - **Code goes to Google.** Every task sends source code to Google's servers. Employer or client repositories may forbid that, so projects are **opt-in** for external execution (R3).
 - **`agy` reads more than tracked code.** A task's scope limits what `agy` may change, not what it may read, and gitignored files such as `.env` are in the working tree too. orch names the sensitive ones at opt-in, in `orch project show`, and at every dispatch (R3).
+- **Snapshots can't see ignored files.** So orch also fingerprints the sensitive files outside git around every attempt, in memory only (sha256 and size, never stored). A change is recorded as an audit event, and counts in the evidence as a scope violation and a sensitive-file flag.
 
 ### 2.3 Claude side
 

@@ -10,9 +10,11 @@
 
 from __future__ import annotations
 
+import hashlib
 import os
 import shutil
 import signal
+import stat
 import subprocess
 import tempfile
 import threading
@@ -29,6 +31,8 @@ from orch.policy import classify_paths, is_protected_branch
 from orch.redact import redact, truncate_middle
 
 SNAPSHOT_TIMEOUT = 300.0
+FINGERPRINT_MAX_FILES = 2000
+FINGERPRINT_MAX_BYTES = 64 * 1024 * 1024
 
 
 @dataclass
@@ -77,6 +81,54 @@ def readable_secrets(root: Path, cfg: Config) -> list[str]:
         return []
     outside = [e[3:] for e in out.split("\0") if e[:3] in ("?? ", "!! ")]
     return sorted(globs.matching(outside, cfg.get("policy", "sensitive_globs")))
+
+
+def fingerprint(root: Path, paths: list[str]) -> dict[str, str]:
+    """A fingerprint of each regular file at or under `paths`, to notice changes git can't see.
+
+    Kept in memory only, never stored: a hash of a short secret could be guessed back. Directories
+    are walked without following symlinks, up to FINGERPRINT_MAX_FILES files in all; files larger
+    than FINGERPRINT_MAX_BYTES are compared by size and modification time instead of content.
+    """
+    prints: dict[str, str] = {}
+    for rel in paths:
+        base = root / rel.rstrip("/")
+        if base.is_file():
+            files = [base]
+        elif base.is_dir():
+            files = []
+            for d, dirs, names in os.walk(base):
+                dirs.sort()
+                files += [Path(d, n) for n in sorted(names)]
+        else:
+            continue
+        for f in files:
+            if len(prints) >= FINGERPRINT_MAX_FILES:
+                return prints
+            try:
+                st = f.stat()
+                if not stat.S_ISREG(st.st_mode):
+                    continue
+                if st.st_size > FINGERPRINT_MAX_BYTES:
+                    value = f"size={st.st_size} mtime={st.st_mtime_ns}"
+                else:
+                    h = hashlib.sha256()
+                    with f.open("rb") as fh:
+                        for chunk in iter(lambda: fh.read(1 << 20), b""):
+                            h.update(chunk)
+                    value = f"sha256={h.hexdigest()} size={st.st_size}"
+            except OSError:
+                continue
+            prints[f.relative_to(root).as_posix()] = value
+    return prints
+
+
+def fingerprint_changes(before: dict[str, str], after: dict[str, str]) -> list[dict[str, str]]:
+    """Which fingerprinted files were created, modified or deleted (paths only)."""
+    changes = [{"path": p, "change": "created"} for p in after if p not in before]
+    changes += [{"path": p, "change": "deleted"} for p in before if p not in after]
+    changes += [{"path": p, "change": "modified"} for p in before if p in after and before[p] != after[p]]
+    return sorted(changes, key=lambda c: c["path"])
 
 
 def snapshot(root: Path) -> Snapshot:
@@ -224,12 +276,15 @@ def collect(
     cfg: Config,
     report: dict[str, Any] | None,
     prior_paths: set[str] | None = None,
+    ignored_changes: list[dict[str, str]] | None = None,
 ) -> dict[str, Any]:
     """Compare the tree after a run with the task's baseline (cumulative) and the run's start (this attempt).
 
     Only paths the executor touched during one of this task's attempts are attributed
     to it (`prior_paths` holds those of earlier attempts). Files created between
     attempts, such as artifacts of the engine's own check runs, are not.
+    `ignored_changes` are sensitive files outside git that the executor's attempts
+    changed (see fingerprint): snapshots can't see them, so they are added here.
     """
     after = snapshot(root)
     max_patch = cfg.get("limits", "evidence_output_bytes") * 3
@@ -239,7 +294,9 @@ def collect(
     changes, patch, truncated = diff_trees(root, baseline, after.tree, max_patch, executor_paths)
     _, attempt_patch, attempt_truncated = diff_trees(root, before.tree, after.tree, max_patch, sorted(attempt_paths))
     changed = sorted({c.path for c in changes} | {c.old_path for c in changes if c.old_path})
-    violations = [p for p in changed
+    ignored_changes = ignored_changes or []
+    ignored_paths = sorted({c["path"] for c in ignored_changes})
+    violations = [p for p in [*changed, *ignored_paths]
                   if not globs.match_any(p, spec.scope.allow) or globs.match_any(p, spec.scope.deny)]
     classes = classify_paths(changed, cfg)
     deleted_files = sorted(c.path for c in changes if c.status == "D")
@@ -251,8 +308,9 @@ def collect(
         if cfg.requires_approval(action):
             flags.append({"action": action, "detail": detail})
 
-    if classes.sensitive:
-        flag("sensitive_file", ", ".join(classes.sensitive))
+    sensitive = classes.sensitive + [f"{c['path']} ({c['change']}, outside git)" for c in ignored_changes]
+    if sensitive:
+        flag("sensitive_file", ", ".join(sensitive))
     if classes.dependency:
         flag("dependency_change", ", ".join(classes.dependency))
     if classes.migration:
@@ -276,6 +334,7 @@ def collect(
         "patch_truncated": truncated,
         "attempt_patch": attempt_patch,
         "attempt_patch_truncated": attempt_truncated,
+        "ignored_sensitive_changes": ignored_changes,
         "scope_violations": violations,
         "policy_flags": flags,
         "report": report,

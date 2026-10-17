@@ -159,6 +159,15 @@ class Engine:
                 return run["after_tree"]
         return None
 
+    def _ignored_changes(self, task_id: str) -> list[dict[str, str]]:
+        """Sensitive files outside git that any of this task's runs changed, failed and interrupted runs included."""
+        events = self.store.list_events(subject_type="task", subject_id=task_id, limit=100_000)
+        latest: dict[str, str] = {}
+        for e in reversed(events):  # oldest first, so the latest change of each path wins
+            if e["kind"] == "policy.ignored_sensitive_changed":
+                latest.update({c["path"]: c["change"] for c in e["data"]["changes"]})
+        return [{"path": p, "change": c} for p, c in sorted(latest.items())]
+
     def _prior_paths(self, root: Path, task_id: str, current_run: int) -> set[str]:
         """Paths the executor touched in this task's earlier runs, including runs that failed or were interrupted."""
         by_run = self.store.evidence_by_run(task_id)
@@ -219,6 +228,7 @@ class Engine:
             task = self.store.get_task(task_id)
             attempt = task.attempt + 1
             before = evidence.snapshot(root)
+            ignored_before = evidence.fingerprint(root, evidence.readable_secrets(root, pcfg))
             baseline = extras["baseline_tree"] or before.tree
             updates: dict[str, Any] = {"attempt": attempt}
             if not extras["baseline_tree"]:
@@ -260,6 +270,13 @@ class Engine:
                 usage = usage_delta(self._conversation_usage(task_id, conversation, run_id), result.usage)
             # Recorded for every run, so edits left by a run that then fails stay the executor's on a retry.
             after_tree = evidence.snapshot(root).tree
+            ignored = evidence.fingerprint_changes(
+                ignored_before, evidence.fingerprint(root, evidence.readable_secrets(root, pcfg)))
+            if ignored:
+                self.store.add_event("policy.ignored_sensitive_changed", "task", task_id, "engine", project.id,
+                                     {"run": run_id, "changes": ignored})
+                self.progress(task_id, {"event": "warning", "message": "changed sensitive files outside git: "
+                                        + ", ".join(f"{c['path']} ({c['change']})" for c in ignored)})
             self.store.update_run(
                 run_id, status=result.status.value, conversation_id=conversation, ended_at=now(),
                 classification=result.classification.value, usage=usage, report=result.report,
@@ -298,7 +315,8 @@ class Engine:
 
             self.store.transition_task(task_id, TaskStatus.VERIFYING, "engine", "collecting evidence")
             prior = self._prior_paths(root, task_id, run_id)
-            ev = evidence.collect(root, baseline, before, task.spec, pcfg, result.report, prior)
+            ev = evidence.collect(root, baseline, before, task.spec, pcfg, result.report, prior,
+                                  self._ignored_changes(task_id))
             self.store.update_run(run_id, after_tree=ev["after"]["tree"])
             ev["checks"] = evidence.run_checks(root, project, checks, limits("evidence_output_bytes"))
             post = evidence.snapshot(root)

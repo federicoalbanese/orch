@@ -91,7 +91,7 @@ The test suite went from 168 to 175 tests, with 1 skipped (the live `agy` test).
 
 ## Known limits, not fixed
 
-- **Executor edits to ignored files are invisible.** Snapshots honour `.gitignore`, so evidence can't see if the executor changes a gitignored file such as `.env`. orch now names sensitive ignored files; detecting changes to them is a follow-up.
+- **Executor edits to ignored files.** Snapshots honour `.gitignore`, so evidence couldn't see the executor change a gitignored file such as `.env`. Fixed after 0.5.0 for sensitive files: they are fingerprinted around every attempt, and a change blocks approval (see the changelog). Edits to other ignored files are still invisible.
 - **Ignored and untracked directories are checked as a whole.** The readable-secrets check sees them collapsed, the way git reports them. A `.env` inside an ignored directory isn't named.
 - **The fallback default branch gets protected.** When a repository has no `origin/HEAD` and none of `main`, `master`, `develop` or `dev`, discovery takes the current branch as the default, and that branch becomes protected. `orch project set <id> default_branch <name>` corrects it.
 - **Discovery is limited for PHP projects without tooling.** It doesn't detect CodeIgniter, and proposes no lint for a PHP project that has no linting tools. The changed-files `php -l` lint here was written by hand.

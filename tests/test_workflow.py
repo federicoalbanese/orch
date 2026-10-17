@@ -418,3 +418,86 @@ def test_sensitive_files_outside_git_are_reported(store, paths, cfg, calc):
     assert any(e.get("event") == "warning" and ".env, secrets/" in e["message"] for e in seen)
     events = [e for e in store.list_events(subject_type="task", subject_id=tid) if e["kind"] == "policy.secrets_readable"]
     assert events and events[0]["data"]["paths"] == [".env", "secrets/"]
+
+
+def test_fingerprints_see_what_git_ignores(tmp_path):
+    root = tmp_path / "r"
+    (root / "secrets" / "nested").mkdir(parents=True)
+    (root / ".env").write_text("A=1\n")
+    (root / "secrets" / "nested" / "key.txt").write_text("k\n")
+    (tmp_path / "outside.txt").write_text("not walked\n")
+    (root / "secrets" / "link").symlink_to(tmp_path, target_is_directory=True)
+    before = evidence.fingerprint(root, [".env", "secrets/", "missing/"])
+    assert sorted(before) == [".env", "secrets/nested/key.txt"]  # symlinked directories are not followed
+    assert all(v.startswith("sha256=") for v in before.values())
+    (root / ".env").write_text("A=2\n")
+    (root / "secrets" / "nested" / "key.txt").unlink()
+    (root / "secrets" / "new.pem").write_text("p\n")
+    after = evidence.fingerprint(root, [".env", "secrets/"])
+    assert evidence.fingerprint_changes(before, after) == [
+        {"path": ".env", "change": "modified"},
+        {"path": "secrets/nested/key.txt", "change": "deleted"},
+        {"path": "secrets/new.pem", "change": "created"},
+    ]
+
+
+def _ignore_env(root):
+    (root / ".gitignore").write_text(".env\n")
+    git(root, "add", ".gitignore")
+    git(root, "commit", "-q", "-m", "ignore .env")
+    (root / ".env").write_text("DB_PASSWORD=hunter2\n")
+
+
+def test_executor_edits_to_ignored_sensitive_files_block_approval(store, paths, cfg, calc):
+    """Snapshots honour .gitignore, so an executor's edit to .env was invisible to evidence."""
+    root = Path(calc.root)
+    _ignore_env(root)
+    (tid,) = import_tasks(store, cfg, calc, calc_task())
+    seen = []
+    eng = engine(store, paths, cfg, FakeExecutor([FakeStep(files={"calc.py": GOOD, ".env": "DB_PASSWORD=x\n"},
+                                                           report=DONE)]),
+                 progress=lambda task_id, e: seen.append(e))
+    out = eng.dispatch(tid)
+    assert out.status == "IN_REVIEW" and "scope violation" in out.message
+    bundle = review.build_bundle(store, cfg, tid)
+    ev = bundle["evidence"]
+    assert ev["changed_files"] == ["calc.py"]  # git still can't see .env
+    assert ev["ignored_sensitive_changes"] == [{"path": ".env", "change": "modified"}]
+    assert ev["scope_violations"] == [".env"]
+    assert any(".env (modified, outside git)" in f["detail"] for f in ev["policy_flags"])
+    assert any("changes outside the task's scope: .env" in b for b in bundle["approval_blockers"])
+    assert "Sensitive files outside git that the executor changed (git can't show them): .env (modified)" \
+        in review.render_bundle(bundle)
+    assert any(e.get("event") == "warning" and ".env (modified)" in e["message"] for e in seen)
+    events = [e for e in store.list_events(subject_type="task", subject_id=tid)
+              if e["kind"] == "policy.ignored_sensitive_changed"]
+    assert events[0]["data"]["changes"] == [{"path": ".env", "change": "modified"}]
+    assert "sha256" not in json.dumps(events) and "hunter2" not in json.dumps(ev)  # never hashes or contents
+    with pytest.raises(PolicyError, match="changes outside the task's scope"):
+        review.decide(store, cfg, tid, review_doc("APPROVED"), "claude")
+
+
+def test_ignored_edits_by_a_failed_run_stay_attributed(store, paths, cfg, calc):
+    root = Path(calc.root)
+    _ignore_env(root)
+    (tid,) = import_tasks(store, cfg, calc, calc_task())
+    ex = FakeExecutor([FakeStep(files={".env": "DB_PASSWORD=x\n"}, status=ExecStatus.FAILED,
+                                classification=Classification.TRANSIENT, error="429"),
+                       FakeStep(files={"calc.py": GOOD}, report=DONE)])
+    assert engine(store, paths, cfg, ex).dispatch(tid).status == "IN_REVIEW"
+    ev = review.build_bundle(store, cfg, tid)["evidence"]
+    assert ev["ignored_sensitive_changes"] == [{"path": ".env", "change": "modified"}]
+    assert ev["scope_violations"] == [".env"]
+
+
+def test_the_users_own_edits_to_ignored_files_between_runs_are_not_attributed(store, paths, cfg, calc):
+    root = Path(calc.root)
+    _ignore_env(root)
+    (tid,) = import_tasks(store, cfg, calc, calc_task())
+    ex = FakeExecutor([FakeStep(files={"calc.py": GOOD}, report=DONE)])
+    assert engine(store, paths, cfg, ex).dispatch(tid).status == "IN_REVIEW"
+    (root / ".env").write_text("DB_PASSWORD=rotated\n")  # the user, after the run
+    ev = review.build_bundle(store, cfg, tid)["evidence"]
+    assert ev["ignored_sensitive_changes"] == [] and ev["scope_violations"] == []
+    task, _ = review.decide(store, cfg, tid, review_doc("APPROVED"), "claude")
+    assert task.status == TaskStatus.APPROVED

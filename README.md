@@ -151,7 +151,7 @@ orch log --task P1.T1                    # audit trail
 
 **Projects are opt-in.** Every Antigravity task sends that repository's code to Google, so no project is enabled until you run `orch project engine <id> --allow`. Check your employer's or client's policy before opting in their code.
 
-**Antigravity can read files git ignores.** Its scope limits what it may change, not what it may read. `orch project engine --allow`, `orch project show` and every dispatch name the sensitive files outside git (a `.env`, keys). Move them out of the repository while tasks run.
+**Antigravity can read files git ignores.** Its scope limits what it may change, not what it may read. `orch project engine --allow`, `orch project show` and every dispatch name the sensitive files outside git (a `.env`, keys). Move them out of the repository while tasks run. If Antigravity changes one anyway, the evidence shows it and approval is refused.
 
 **Your default branch is protected**, whatever it is called (`develop`, for example). Work moves to a local `orch/P<n>` branch before Antigravity edits anything.
 

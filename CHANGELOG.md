@@ -1,5 +1,14 @@
 # Changelog
 
+## Unreleased
+
+**Fixed**
+- **Edits to ignored secrets show in the evidence.** Snapshots honour `.gitignore`, so an executor's change to a gitignored file such as `.env` was invisible to the evidence. orch now fingerprints the sensitive files outside git before and after every attempt.
+  - The fingerprints are a sha256 and size per file, kept in memory and never stored.
+  - A change is recorded as a `policy.ignored_sensitive_changed` audit event, even for runs that fail.
+  - It is listed in `orch review show`, and counts as a scope violation and a sensitive-file flag, so APPROVED is refused.
+  - Changes you make yourself between runs are not attributed to the executor.
+
 ## 0.5.0 (2026-10-17)
 
 Validated on a real repository (Phase 5): a large CodeIgniter and Vue platform whose PHP runs only in Docker, with no test suite. One real bug fix went through plan, dispatch, review, one correction and approval. See [docs/validation-phase5.md](docs/validation-phase5.md).
