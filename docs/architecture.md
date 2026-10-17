@@ -1,6 +1,6 @@
 # orch architecture
 
-Status: Phases 1 to 3 are implemented, and Phase 3 was validated live with `agy` ([validation-phase3.md](validation-phase3.md)). Phases 4 to 6 are planned.
+Status: Phases 1 to 4 are implemented. Phase 3 was validated live with `agy` ([validation-phase3.md](validation-phase3.md)). Phases 5 and 6 are planned.
 
 Every capability claim below was verified by probing the real tools (section 2), not assumed.
 
@@ -58,18 +58,20 @@ all hosted on self-hosted GitLab rather than GitHub. Three facts follow:
 | Usage metering | ✅ Verified | Input, output, thinking, and cache-read tokens, as a **running total per conversation**. **No currency cost** is reported |
 | Audit trail | ✅ Verified | Full tool-call transcript at `~/.gemini/antigravity-cli/brain/<conversation-id>/.system_generated/logs/transcript.jsonl` |
 | Model choice | ✅ Verified | `--model`. `agy models` lists the models available to the account |
+| Read-only config queries | ✅ Verified | `agy -p "/permissions"` answers from configuration: no agent turn, no quota, no conversation |
 | Run shell commands (tests, builds) headless | ❌ **Blocked** | Always auto-denied (`denied_actions: RunCommand`) in every mode tried |
 | `--mode auto` | ❌ Unavailable | "not available for this account" on the account tested |
 | `--sandbox` | ❌ No effect | Commands still denied |
-| Scoped command allow-rules | ⚠️ **Exists, not yet tested** | `agy` documents `command(<binary subcommand>)` grants in `permissions.allow` and in project-scoped `permissionGrants`. Testing this changes `agy`'s own permission config, so it is left to Phase 4 |
+| Scoped command allow-rules | ⚠️ **Format verified; headless effect not verified** | `command(<prefix>)` rules in `permissions.allow` (global `settings.json`) are read by `agy`, and match commands by prefix. Whether they take effect in headless `request-review` mode needs a live turn and a change to the user's `agy` config, so it waits for the user's OK. Findings: [agy-command-grants.md](agy-command-grants.md) |
 | `--dangerously-skip-permissions` | 🚫 Rejected by policy | Grants everything; incompatible with least privilege |
 | Desktop app API | ❌ None found | Not used |
 
 ### 2.2 Operational caveats
 
-- **Behaviour can change on update.** `agy` updates itself, so its CLI and output format can change between versions. The adapter isolates this, and contract tests replay recorded output.
+- **Behaviour can change on update.** `agy` updates itself, so its CLI and output format can change between versions. The adapter isolates this, contract tests replay recorded output, and `orch doctor` warns when the installed version differs from the verified one (1.4.0).
+- **Output can be corrupted or cut off.** The adapter skips and counts unreadable lines and events of the wrong shape, so a damaged stream ends as a classified executor error. If an adapter still raises, the engine records the run as FAILED instead of leaving the task RUNNING.
 - **A timeout looks like success.** When `--print-timeout` fires, `agy` still reports `status: SUCCESS` with an empty response, and only stderr says "print timeout". The adapter classifies this as a timeout.
-- **Some errors come from the account, not the run.** `400` (location), `403` (licence), `429` (quota) and "not eligible" come from Google's side. Only `429` is retryable, with backoff.
+- **Some errors come from the account, not the run.** `400` (location), `403` (licence), `429` (quota) and "not eligible" come from Google's side. Only `429` is retryable, with backoff. `orch doctor --probe` runs one tiny read-only turn in an empty directory and classifies these errors, so an account problem shows up before a task fails on it. It sends a request to Google, so it only runs when asked.
 - **Latency varies widely.** A trivial resumed turn took 60 s, while a fresh one took 3 s. Timeouts must be generous and progress has to come from streaming.
 - **Reports use absolute paths** and `file://` markdown links, so the engine normalizes them.
 - **Code goes to Google.** Every task sends source code to Google's servers. Employer or client repositories may forbid that, so projects are **opt-in** for external execution (R3).
@@ -151,6 +153,8 @@ any active state → CANCELLED | FAILED (retry/budget exhausted → escalate)
 RUNNING with a dead engine → INTERRUPTED → READY (orch recover, orch task retry)
 ```
 
+- **Recovery keeps attribution.** `orch recover` snapshots the working tree once the executor is gone, and records it as where the dead run stopped. The same happens for every run that fails. A retry then treats that run's unfinished edits as the executor's own: they don't block the retry, and its evidence includes them. Nothing is reverted.
+
 - **State changes are checked.** Every change is validated against this table, carries a reason, and is written to an append-only audit log in the same transaction.
 - **No duplicate dispatch.** Status changes are compare-and-set, and each run has a unique `(task, attempt, kind)` key.
 - **No rerunning approved work.** An `APPROVED` task is never re-dispatched unless it is explicitly reopened.
@@ -220,7 +224,13 @@ Rules:
 - **Preflight.** A task does not start if uncommitted changes in its scope would be attributed to the executor. Changes that byte-match what an approved task produced don't count, so dependent tasks can build on approved work before it is committed. Later runs of the same task compare against its own last snapshot.
 - **Snapshots.** The whole working tree is recorded through a temporary git index (`read-tree`, `add -A`, `write-tree`). The user's index, files and branches are never touched.
 - **Branching.** Work that would start on a protected branch moves first to `orch/P<n>` (`git switch -c`, which keeps uncommitted work).
-- **Commits and MRs.** These are prepared after approval and need the user's OK.
+- **Commits.** `orch task commit <task>...` commits approved tasks after the user's OK (policy action `git_commit`; refused for Claude unless the policy makes it automatic). `--dry-run` shows the files and the message without committing.
+  - **Exactly the task's files.** It commits the files the evidence attributes to the executor, never check artifacts, other uncommitted work, or anything already staged in the user's index (`git commit --only`).
+  - **Only reviewed content.** Each file must still hold its approved content. A file changed again by a later approved task needs both tasks in one commit.
+  - **Literal paths.** File names are never treated as patterns.
+  - **Protected branches.** Committing on one is refused.
+  - **The message.** It is built from the task spec and the engine's evidence, with `Orch-Task:` trailers. orch never adds `Co-Authored-By` trailers, and it removes any from a message it is given.
+  - **Never pushes.** Pushing, MRs and merges stay with the user.
 - **Concurrency.** One task per repository working tree by default. Parallelism happens across repositories.
 
 ### 3.9 Cost and usage
@@ -244,7 +254,7 @@ Rules:
 | 1 Discovery | This document | ✅ |
 | 2 Core | Schemas and models, SQLite store with migrations, config and policy, project registry and stack discovery, executor interface, CLI, unit tests | ✅ |
 | 3 First end-to-end | `agy` adapter, evidence collector, review and correction loop, auto-fix, scheduler, cancellation, recovery, manual fallback, Claude Code skill; validated live | ✅ |
-| 4 Reliability and safety | Deeper `orch doctor` (version and account checks), commit preparation with approval, more failure-injection tests, evaluating scoped `agy` command grants | Planned |
+| 4 Reliability and safety | Deeper `orch doctor` (version check, `--probe` account check), commits with approval, failure-injection tests (killed engine, real cancellation, retry exhaustion, corrupted output), scoped `agy` command grants evaluated ([findings](agy-command-grants.md)) | ✅ |
 | 5 Multi-project | Several real repositories of different stacks, each opted in deliberately | Planned |
 | 6 Optimization | Headless `claude -p` mode, worktree parallelism, context compaction, usage reports, dashboard | Planned |
 
@@ -254,10 +264,10 @@ Rules:
 
 | # | Risk | Mitigation |
 |---|---|---|
-| R1 | An `agy` self-update changes its CLI or output | The adapter isolates it; contract tests replay recorded output; `orch doctor` shows the version |
-| R2 | The Google account is rate-limited, unlicensed, or not eligible (429/403/400) | Back off on 429; classify the others as `ENV_BLOCKED` and escalate; nothing is half-applied |
+| R1 | An `agy` self-update changes its CLI or output | The adapter isolates it and parses defensively; contract tests replay recorded and corrupted output; `orch doctor` warns when the version differs from the verified one |
+| R2 | The Google account is rate-limited, unlicensed, or not eligible (429/403/400) | Back off on 429; classify the others as `ENV_BLOCKED` and escalate; nothing is half-applied; `orch doctor --probe` checks the account on request |
 | R3 | **Employer or client source code is sent to Google** | `allow_external_engine` is off by default per project; only a person can opt a project in |
-| R4 | `agy` can't run tests itself, so it iterates more slowly | Engine-run verification plus the auto-fix loop; scoped grants evaluated in Phase 4 |
+| R4 | `agy` can't run tests itself, so it iterates more slowly | Engine-run verification plus the auto-fix loop. Scoped grants exist but are prefix-wide, outlive tasks and bypass `agy`'s sandbox; their headless effect is unverified, so orch does not use them ([findings](agy-command-grants.md)) |
 | R5 | Docker-based tests need running containers and are slow | Per-command `requires_services` and generous timeouts; starting services needs approval |
 | R6 | The executor edits outside scope or refactors unrelated code | Snapshot plus scope check: violations block approval and auto-fix. The engine never reverts work automatically |
 | R7 | Concurrent tasks collide in one working tree | One task per repository by default; scope-overlap checks |

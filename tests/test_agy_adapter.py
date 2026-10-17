@@ -1,7 +1,5 @@
 import json
 import os
-import stat
-import sys
 import threading
 import time
 from pathlib import Path
@@ -12,21 +10,14 @@ from orch.executors.agy import AgyExecutor, classify, extract_report
 from orch.executors.base import Classification, ExecRequest, ExecStatus, Mode
 from orch.schema import REPORT_SCHEMA
 
+from conftest import agy_result as result_line
+
 FIXTURES = Path(__file__).parent / "fixtures" / "agy"
 
 
-def result_line(**result) -> str:
-    base = {"conversation_id": "c-1", "status": "SUCCESS", "response": "", "duration_seconds": 1, "num_turns": 1,
-            "usage": {"input_tokens": 10, "output_tokens": 2}}
-    base.update(result)
-    return json.dumps({"event": "result", "result": base})
-
-
 @pytest.fixture
-def agy(tmp_path, monkeypatch):
-    script = tmp_path / "agy"
-    script.write_text(f"#!/bin/sh\nexec {sys.executable} {Path(__file__).parent / 'fake_agy.py'} \"$@\"\n")
-    script.chmod(script.stat().st_mode | stat.S_IEXEC)
+def agy(tmp_path, monkeypatch, fake_agy_bin):
+    script = fake_agy_bin
     workdir = tmp_path / "work"
     workdir.mkdir()
     (workdir / "calc.py").write_text("def add(a, b):\n    return a + b\n")

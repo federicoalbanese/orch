@@ -13,48 +13,7 @@ from orch.models import ReviewDecision, TaskStatus
 from orch.redact import redact, truncate_middle
 from orch.store import Store
 
-from conftest import all_tools, git, plan_dict, task_dict
-
-CALC = "def add(a, b):\n    return a - b\n"
-GOOD = "def add(a, b):\n    return a + b\n"
-DONE = {"status": "DONE", "files_changed": ["calc.py"], "summary": "fixed add", "unresolved": []}
-
-
-@pytest.fixture
-def calc(store, paths, make_repo):
-    """A tiny repo with a bug, a confirmed check, opted in, on a working branch."""
-    root = make_repo("calc", {"calc.py": CALC, "pyproject.toml": "[project]\nname='calc'\n", "README.md": "# calc\n"})
-    git(root, "switch", "-q", "-c", "work")
-    p, _ = registry.add_project(store, paths, root, "user", which=all_tools)
-    registry.set_command(store, p.id, "test", "python3 -c 'import calc; assert calc.add(2, 3) == 5'", "user",
-                         timeout_seconds=60, confirm=True)
-    registry.remove_command(store, p.id, "lint", "user") if "lint" in store.get_project(p.id).commands else None
-    registry.set_engine(store, p.id, True, "user")
-    registry.set_field(store, p.id, "executor", "fake", "user")
-    return store.get_project(p.id)
-
-
-def calc_task(key="T1", **kw):
-    t = task_dict(key, scope={"allow": ["calc.py", "test_calc.py"]}, relevant_files=["calc.py"],
-                  acceptance=[{"id": "A1", "text": "add() adds", "verify": {"kind": "command", "command": "test"}},
-                              {"id": "A2", "text": "a regression test exists", "verify": {"kind": "review"}}])
-    t.update(kw)
-    return t
-
-
-def import_tasks(store, cfg, project, *tasks):
-    return [t.id for t in plans.import_plan(store, cfg, plan_dict(project.id, list(tasks)), "claude").tasks]
-
-
-def engine(store, paths, cfg, ex, **kw):
-    return workflow.Engine(store, paths, cfg, executor_factory=lambda name: ex, sleep=lambda s: None,
-                           cancel_poll_seconds=0.05, **kw)
-
-
-def review_doc(decision, met=True, findings=None, summary="looks right"):
-    return {"decision": decision, "summary": summary,
-            "criteria": [{"id": "A1", "met": met, "evidence": "test passed"}, {"id": "A2", "met": met}],
-            "findings": findings or []}
+from conftest import CALC, DONE, GOOD, all_tools, calc_task, engine, git, import_tasks, review_doc
 
 
 def test_full_loop_with_a_correction_cycle(store, paths, cfg, calc):

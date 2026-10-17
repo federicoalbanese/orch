@@ -64,6 +64,8 @@ class Health:
     ok: bool
     detail: str
     version: str | None = None
+    # The version the adapter was verified against, when it depends on a tool that updates itself.
+    verified_version: str | None = None
 
 
 @dataclass

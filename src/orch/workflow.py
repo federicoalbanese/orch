@@ -149,14 +149,29 @@ class Engine:
         return problems, executor_name
 
     def _last_after_tree(self, task_id: str) -> str | None:
-        """The tree as the engine last left it for this task (after its checks ran)."""
-        for ev in reversed(self.store.task_evidence(task_id)):
-            if ev.get("checks_tree") or ev.get("after"):
-                return ev.get("checks_tree") or ev["after"]["tree"]
+        """The tree as this task's latest run left it: after its checks ran, or where it failed or was interrupted."""
+        by_run = self.store.evidence_by_run(task_id)
         for run in reversed(self.store.list_runs(task_id)):
+            ev = by_run.get(run["id"])
+            if ev:
+                return ev.get("checks_tree") or ev["after"]["tree"]
             if run.get("after_tree"):
                 return run["after_tree"]
         return None
+
+    def _prior_paths(self, root: Path, task_id: str, current_run: int) -> set[str]:
+        """Paths the executor touched in this task's earlier runs, including runs that failed or were interrupted."""
+        by_run = self.store.evidence_by_run(task_id)
+        paths: set[str] = set()
+        for run in self.store.list_runs(task_id):
+            if run["id"] == current_run:
+                continue
+            if run["id"] in by_run:
+                paths |= set(by_run[run["id"]].get("attempt_changed_files", []))
+            elif run.get("before_tree") and run.get("after_tree") and run["before_tree"] != run["after_tree"]:
+                changes, _, _ = evidence.diff_trees(root, run["before_tree"], run["after_tree"], 1000)
+                paths |= {c.path for c in changes} | {c.old_path for c in changes if c.old_path}
+        return paths
 
     def dispatch(self, task_id: str) -> Outcome:
         task = self.store.get_task(task_id)
@@ -227,6 +242,9 @@ class Engine:
             )
             try:
                 result = executor.run(request, cancel, on_event)
+            except Exception as e:  # an adapter bug must end the run as FAILED, never leave the task RUNNING
+                result = ExecResult(ExecStatus.FAILED, Classification.EXECUTOR_ERROR, conversation,
+                                    error=f"the {executor_name} adapter crashed: {type(e).__name__}: {e}")
             finally:
                 stop.set()
                 watcher.join(timeout=5)
@@ -235,17 +253,19 @@ class Engine:
             usage = result.usage
             if caps.cumulative_usage and resumed_from and resumed_from == conversation:
                 usage = usage_delta(self._conversation_usage(task_id, conversation, run_id), result.usage)
+            # Recorded for every run, so edits left by a run that then fails stay the executor's on a retry.
+            after_tree = evidence.snapshot(root).tree
             self.store.update_run(
                 run_id, status=result.status.value, conversation_id=conversation, ended_at=now(),
                 classification=result.classification.value, usage=usage, report=result.report,
-                transcript_path=result.transcript_path, error=result.error,
+                transcript_path=result.transcript_path, error=result.error, after_tree=after_tree,
             )
             if self.store.get_task(task_id).status == TaskStatus.CANCELLED:
                 outcome.status, outcome.message = "CANCELLED", (
                     "cancelled while running; anything the executor changed before stopping was left in place")
                 return outcome
 
-            changed = evidence.snapshot(root).tree != before.tree
+            changed = after_tree != before.tree
             if result.status == ExecStatus.SUCCEEDED or (result.status == ExecStatus.DENIED and changed):
                 note = f" (it also tried denied actions: {', '.join(result.denied_actions)})" if result.denied_actions else ""
                 self.store.transition_task(task_id, TaskStatus.EXECUTED, "engine", "executor finished" + note)
@@ -272,7 +292,7 @@ class Engine:
                 return outcome
 
             self.store.transition_task(task_id, TaskStatus.VERIFYING, "engine", "collecting evidence")
-            prior = {p for e in self.store.task_evidence(task_id) for p in e.get("attempt_changed_files", [])}
+            prior = self._prior_paths(root, task_id, run_id)
             ev = evidence.collect(root, baseline, before, task.spec, pcfg, result.report, prior)
             self.store.update_run(run_id, after_tree=ev["after"]["tree"])
             ev["checks"] = evidence.run_checks(root, project, checks, limits("evidence_output_bytes"))
@@ -393,8 +413,29 @@ def _alive(pid: int | None) -> bool:
     return True
 
 
+def _stop_group(pid: int, grace: float = 10.0) -> None:
+    """SIGTERM the executor's process group, then SIGKILL it if it is still there after `grace` seconds."""
+    try:
+        os.killpg(pid, signal.SIGTERM)
+    except (ProcessLookupError, PermissionError):
+        return
+    deadline = time.monotonic() + grace
+    while time.monotonic() < deadline and _alive(pid):
+        time.sleep(0.1)
+    try:
+        os.killpg(pid, signal.SIGKILL)
+    except (ProcessLookupError, PermissionError):
+        pass
+
+
 def recover(store: Store, actor: str, kill: bool = False) -> list[dict[str, Any]]:
-    """Reconcile runs whose orchestrating process died (crash, reboot, killed terminal)."""
+    """Reconcile runs whose orchestrating process died (crash, reboot, killed terminal).
+
+    The working tree is snapshotted once the executor is gone, and the run keeps that tree
+    as where it stopped. A retry then treats the dead run's unfinished edits as the
+    executor's own: they don't block the retry, and the evidence attributes them.
+    Nothing is ever reverted.
+    """
     report: list[dict[str, Any]] = []
     for run in store.list_runs(status="running"):
         if run["owner_pid"] != os.getpid() and _alive(run["owner_pid"]):
@@ -406,12 +447,16 @@ def recover(store: Store, actor: str, kill: bool = False) -> list[dict[str, Any]
                 report.append({"run": run["id"], "task_id": run["task_id"], "result": "executor still alive",
                                "pid": run["pid"], "hint": "rerun with --kill to stop it"})
                 continue
-            try:
-                os.killpg(run["pid"], signal.SIGTERM)
-            except (ProcessLookupError, PermissionError):
-                pass
-        store.update_run(run["id"], status="interrupted", ended_at=now(), error="orchestrating process died")
+            _stop_group(run["pid"])
         task = store.get_task(run["task_id"])
+        stopped_at: dict[str, Any] = {}
+        if run.get("before_tree"):
+            try:
+                stopped_at["after_tree"] = evidence.snapshot(Path(store.get_project(task.project_id).root)).tree
+            except OrchError:
+                pass
+        store.update_run(run["id"], status="interrupted", ended_at=now(), error="orchestrating process died",
+                         **stopped_at)
         if task.status in ACTIVE:
             store.transition_task(task.id, TaskStatus.INTERRUPTED, actor, "recovered after the engine stopped")
         report.append({"run": run["id"], "task_id": run["task_id"], "result": "interrupted"})

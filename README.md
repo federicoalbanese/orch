@@ -62,7 +62,8 @@ flowchart LR
 - 🧭 **Universal.** Stack discovery for PHP/Laravel, Node, Go, Python, Rust, Dart/Flutter, Java/Kotlin and Ruby, plus Makefiles and Docker Compose. Commands that only run in containers get container commands proposed.
 - 🧾 **Auditable.** SQLite state with an append-only event log. Every status change has an actor and a reason.
 - 🧠 **Project memory with provenance.** Knowledge entries record their source and the commit they were verified at, and go stale automatically when the files they describe change.
-- 🔁 **Resilient.** Retry with backoff for rate limits, cancellation from any terminal, crash recovery, and a manual fallback that hands the prompt to the Antigravity desktop app.
+- 🔁 **Resilient.** Retry with backoff for rate limits, cancellation from any terminal, crash recovery that keeps the dead run's edits attributed, tolerance of corrupted executor output, and a manual fallback that hands the prompt to the Antigravity desktop app.
+- 📝 **Commits only what was reviewed.** `orch task commit` commits exactly an approved task's own files, after your OK. It never pushes and never adds `Co-Authored-By` trailers.
 - 📦 **Zero dependencies.** Standard-library Python 3.11+. Nothing to install but the tool itself.
 
 ## Requirements
@@ -84,6 +85,8 @@ pipx install git+https://github.com/federicoalbanese/orch.git
 ```bash
 orch init && orch doctor
 ```
+
+`orch doctor --probe` also checks that your Google account can use Antigravity. It sends one tiny read-only request (no code), and tells location, licence, eligibility and rate-limit problems apart.
 
 ```bash
 orch skill install
@@ -117,6 +120,7 @@ You only step in for the actions reserved for you:
 orch project command confirm shop    # trust the discovered test/lint commands
 orch project engine shop --allow     # allow this repo's code to be sent to Antigravity
 orch plan approve P1 --reason "..."  # only when a plan needs approval
+orch task commit P1.T1               # commit an approved task's files (Claude prepares it with --dry-run)
 orch status                          # what's waiting on you, in review, running, ready
 ```
 
@@ -141,7 +145,7 @@ orch log --task P1.T1                    # audit trail
 | Action | Who | Notes |
 |---|---|---|
 | Inspect, edit inside the task's scope, run confirmed checks, create a working branch | Automatic | Configurable per project |
-| High-risk tasks, architectural decisions, dependency or migration changes, sensitive files, deletions, commits, pushes, MRs | Approval required | Configurable per project |
+| High-risk tasks, architectural decisions, dependency or migration changes, sensitive files, deletions, commits, pushes, MRs | Approval required | Configurable per project. orch commits on request (`orch task commit`) but never pushes |
 | Confirm commands, opt a project in to an external engine, approve tasks, accept results that need a human | **You only** | Refused for Claude, even with `--actor user` |
 | Force-push, production deploy, merge into protected branches, discard your changes, destructive migrations, secret changes | **Never automatic** | Can't be configured away |
 
@@ -151,7 +155,7 @@ orch log --task P1.T1                    # audit trail
 
 | Command | Purpose |
 |---|---|
-| `orch init` · `orch doctor` | Set up and check the environment |
+| `orch init` · `orch doctor [--probe]` | Set up and check the environment (`--probe` checks the Antigravity account) |
 | `orch project discover\|add\|list\|show\|refresh` | Register and inspect repositories |
 | `orch project command set\|confirm\|remove` | Manage build, test and lint commands |
 | `orch project engine <id> --allow\|--deny` | Opt a project in or out of Antigravity |
@@ -159,6 +163,7 @@ orch log --task P1.T1                    # audit trail
 | `orch run` | Dispatch READY tasks |
 | `orch review show\|decide` | Evidence bundles and review decisions |
 | `orch task list\|show\|ready\|approve\|accept\|retry\|cancel` | Task control |
+| `orch task commit <task>... [--dry-run]` | Commit approved tasks' own files (needs you by default; never pushes) |
 | `orch context add\|list\|check\|reverify\|show` | Project knowledge with provenance |
 | `orch status` · `orch log` · `orch recover` | Overview, audit trail, crash recovery |
 | `orch skill install\|path` | The Claude Code skill |
@@ -195,17 +200,16 @@ orch project override shop limits.max_review_cycles 5
 
 ## Status and limitations
 
-orch is **alpha**. Phases 1 to 3 are done and were [validated live](docs/validation-phase3.md) on a sample repository, where Claude sent back one correction per task and approved both.
+orch is **alpha**. Phases 1 to 4 are done. Phase 3 was [validated live](docs/validation-phase3.md) on a sample repository, where Claude sent back one correction per task and approved both. Phase 4 hardened the engine against killed engines, cancelled processes, exhausted retries and corrupted executor output.
 
 Known limitations:
 
-- **Antigravity can't run shell commands in headless mode.** The engine runs every check and feeds failures back.
+- **Antigravity can't run shell commands in headless mode.** The engine runs every check and feeds failures back. `agy` has scoped command grants, but they are prefix-wide and their headless effect is unverified, so orch doesn't use them ([findings](docs/agy-command-grants.md)).
 - **Token usage, not cost.** `agy` reports token usage but no cost.
-- **Commits and merge requests are manual.** orch prepares the branch; committing and pushing are left to you for now.
+- **Pushes and merge requests are manual.** orch commits an approved task's files when you run `orch task commit`; pushing and opening MRs are up to you.
 - **Untested on Windows.**
 
 Roadmap:
-- **Phase 4:** reliability hardening.
 - **Phase 5:** multi-repository validation.
 - **Phase 6:** an unattended mode with headless Claude, worktree parallelism, and a dashboard.
 
@@ -215,6 +219,7 @@ Details are in [docs/architecture.md](docs/architecture.md).
 
 - [Architecture](docs/architecture.md): design, verified integration facts, state machine, policy, risks
 - [Phase 3 validation](docs/validation-phase3.md): a full live run, with every defect it exposed
+- [Scoped `agy` command grants](docs/agy-command-grants.md): what exists, what was verified, and why orch doesn't use them yet
 - [Changelog](CHANGELOG.md) · [Contributing](CONTRIBUTING.md) · [Security](SECURITY.md)
 
 ## Development
@@ -227,7 +232,7 @@ git clone https://github.com/federicoalbanese/orch.git && cd orch
 python3 -m pytest
 ```
 
-The tests build throwaway git repositories and a stand-in `agy` binary. They never touch your configuration, your repositories, or the network. To also run the one live test against the real `agy`, set `ORCH_LIVE_AGY=1`.
+The tests build throwaway git repositories and a stand-in `agy` binary. Some of them kill and cancel real subprocesses on purpose. They never touch your configuration (git's included), your repositories, or the network. To also run the one live test against the real `agy`, set `ORCH_LIVE_AGY=1`.
 
 ## License
 

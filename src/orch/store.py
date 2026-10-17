@@ -545,6 +545,13 @@ class Store:
         ).fetchall()
         return [json.loads(r["data"]) for r in rows]
 
+    def evidence_by_run(self, task_id: str) -> dict[int, dict[str, Any]]:
+        rows = self.conn.execute(
+            "SELECT e.run_id, e.data FROM evidence e JOIN runs r ON r.id = e.run_id WHERE r.task_id = ? ORDER BY e.id",
+            (task_id,),
+        ).fetchall()
+        return {r["run_id"]: json.loads(r["data"]) for r in rows}
+
     def approved_changes(self, project_id: str) -> dict[str, str]:
         """path -> tree id holding the content an APPROVED task left it in (latest approval wins).
 
@@ -572,6 +579,28 @@ class Store:
             tree = data.get("checks_tree") or data["after"]["tree"]
             for path in set(data.get("changed_files", [])) | artifacts:
                 out[path] = tree
+        return out
+
+    def approved_files(self, project_id: str) -> dict[str, tuple[str, str]]:
+        """path -> (task id, tree with the approved content) for every file an APPROVED task's executor changed.
+
+        Only the executor's changed files count, never check artifacts. When several approved
+        tasks changed a file, the task with the newest evidence wins.
+        """
+        rows = self.conn.execute(
+            "SELECT r.task_id, e.data FROM evidence e JOIN runs r ON r.id = e.run_id"
+            " JOIN tasks t ON t.id = r.task_id WHERE t.project_id = ? AND t.status = 'APPROVED' ORDER BY e.id",
+            (project_id,),
+        ).fetchall()
+        latest: dict[str, dict[str, Any]] = {}
+        for row in rows:
+            latest.pop(row["task_id"], None)  # re-insert, so the order is by each task's newest evidence
+            latest[row["task_id"]] = json.loads(row["data"])
+        out: dict[str, tuple[str, str]] = {}
+        for task_id, data in latest.items():
+            tree = data.get("checks_tree") or data["after"]["tree"]
+            for path in data.get("changed_files", []):
+                out[path] = (task_id, tree)
         return out
 
     def insert_review(self, task_id: str, attempt: int, decision: str, data: dict[str, Any], reviewer: str) -> int:

@@ -1,5 +1,32 @@
 # Changelog
 
+## 0.4.0 (2026-10-17)
+
+Reliability and safety (Phase 4).
+
+**Added**
+- `orch task commit <task>...` commits approved tasks after your OK. Policy action `git_commit` needs approval by default, so the command is refused for Claude unless the policy makes it automatic.
+  - It commits exactly the files the evidence attributes to the executor: never check artifacts, other uncommitted work, or what is already staged in your index.
+  - Every file must still hold its reviewed content. A file changed again by a later approved task needs both tasks in one commit.
+  - The message comes from the task and the engine's evidence, with `Orch-Task:` trailers. orch never adds `Co-Authored-By` trailers, and it strips them from messages it is given.
+  - `--dry-run` shows the files and the message without committing. The command refuses protected branches, and never pushes.
+- `orch doctor` shows the `agy` version, and warns when it differs from the version the adapter was verified against (1.4.0).
+- `orch doctor --probe` runs one tiny read-only `agy` turn in an empty directory, to check that the account works. It classifies location, licence, eligibility, sign-in and rate-limit errors, and never runs without the flag.
+- [docs/agy-command-grants.md](docs/agy-command-grants.md): what `agy`'s scoped command grants are, what was verified, and why orch doesn't use them yet.
+
+**Fixed** (found by the new failure-injection tests)
+- **Recovering a killed engine.** After `orch recover`, `orch task retry` could not continue when the killed run had already edited files: preflight blocked the retry on the executor's own unfinished work. `orch recover` now stops the executor, waits for it to exit, and records where the run stopped. The retry continues from there, and its evidence includes those edits.
+- **Edits from failed runs.** Edits made by a run that then failed (a rate limit, for example) were dropped from the evidence when the retry didn't touch those files again. Every run now records its end state, and evidence covers the edits of all of a task's runs.
+- **Corrupted executor output.** A corrupted `agy` stream could crash the adapter and leave the task RUNNING: an event of the wrong shape, a non-text response, `NaN` token counts. The adapter now skips and counts unreadable lines, and reports a classified executor error. If an adapter raises anyway, the engine records the run as FAILED.
+
+**Tests**
+- Failure injection:
+  - `orch run` killed with SIGKILL mid-run, then `orch recover`, `--kill` and `orch task retry`;
+  - cancelling a real executor subprocess from another connection;
+  - transient-retry backoff exhaustion;
+  - corrupted, truncated and mistyped `agy` streams.
+- Tests no longer read your global or system git configuration.
+
 ## 0.3.1 (2026-10-17)
 
 **Fixed**

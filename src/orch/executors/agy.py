@@ -11,17 +11,23 @@ Verified (docs/architecture.md, section 2):
 - On `--print-timeout`, agy prints "print timeout ..." on stderr and still reports
   status SUCCESS with an empty response, so stderr decides, not the status field.
 - SIGTERM ends a run cleanly (exit 1, "interrupted").
+
+The stream is parsed defensively: unreadable lines and events of the wrong shape
+are skipped and counted, so a corrupted or truncated stream ends as a classified
+executor error, never as an exception.
 """
 
 from __future__ import annotations
 
 import json
+import math
 import os
 import queue
 import re
 import shutil
 import signal
 import subprocess
+import tempfile
 import threading
 import time
 from pathlib import Path
@@ -39,6 +45,10 @@ from orch.schema import REPORT_SCHEMA, validate
 MAX_PROMPT_BYTES = 120_000
 KILL_GRACE_SECONDS = 10.0
 DEADLINE_SLACK_SECONDS = 60.0
+# The agy version every behaviour above was verified against (docs/architecture.md, R1).
+VERIFIED_VERSION = "1.4.0"
+PROBE_PROMPT = ("This is an account check by orch. Do not use any tools and do not read or change any files. "
+                "Reply with the single word OK.")
 
 _ENV_BLOCKED = [
     (re.compile(r"user location is not supported", re.I), "Google rejected the network location (HTTP 400)"),
@@ -84,14 +94,46 @@ def classify(
     return ExecStatus.SUCCEEDED, Classification.NONE, None
 
 
+def _text(value: Any) -> str:
+    """A string field from the stream; anything else (a number, an object, null) becomes text or ''."""
+    if isinstance(value, str):
+        return value
+    return "" if value is None else json.dumps(value)
+
+
+def _sanitize_result(raw: Any) -> dict[str, Any] | None:
+    """The result object with every field the adapter reads coerced to the type it expects."""
+    if not isinstance(raw, dict):
+        return None
+    result = dict(raw)
+    for key in ("status", "response", "conversation_id"):
+        if key in result:
+            result[key] = _text(result[key])
+    denied = result.get("denied_actions")
+    if isinstance(denied, str):
+        result["denied_actions"] = [denied]
+    elif not isinstance(denied, list):
+        result["denied_actions"] = []
+    if not isinstance(result.get("usage"), dict):
+        result.pop("usage", None)
+    return result
+
+
 def _tail(text: str, n: int = 600) -> str:
     text = text.strip()
     return text[-n:]
 
 
 def _denied_names(result: dict[str, Any]) -> list[str]:
-    return [d.get("display_name") or d.get("action") or str(d) if isinstance(d, dict) else str(d)
+    return [_text(d.get("display_name") or d.get("action")) or json.dumps(d) if isinstance(d, dict) else _text(d)
             for d in result.get("denied_actions") or []]
+
+
+def _usage(raw: Any) -> dict[str, int] | None:
+    if not isinstance(raw, dict):
+        return None
+    return {k: int(v) for k, v in raw.items()
+            if isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v)}
 
 
 def extract_report(result: dict[str, Any] | None, workdir: Path) -> tuple[dict[str, Any] | None, str | None]:
@@ -143,7 +185,18 @@ class AgyExecutor(ExecutionEngine):
         except (OSError, subprocess.TimeoutExpired) as e:
             return Health(ok=False, detail=f"agy --version failed: {e}")
         version = proc.stdout.strip() or None
-        return Health(ok=proc.returncode == 0, detail=f"{self.binary} {version or ''}".strip(), version=version)
+        return Health(ok=proc.returncode == 0, detail=f"{self.binary} {version or ''}".strip(), version=version,
+                      verified_version=VERIFIED_VERSION)
+
+    def probe(self, model: str | None = None, timeout_seconds: int = 120) -> ExecResult:
+        """One tiny read-only turn, to check that the account works (sign-in, licence, location, eligibility, quota).
+
+        It runs in an empty temporary directory, so no repository content is involved, but the
+        prompt still goes to Google and spends a little quota. Callers run it only when asked.
+        """
+        with tempfile.TemporaryDirectory(prefix="orch-agy-probe-") as tmp:
+            return self.run(ExecRequest(task_id="doctor-probe", attempt=1, workdir=tmp, prompt=PROBE_PROMPT,
+                                        mode=Mode.READ_ONLY, model=model, timeout_seconds=timeout_seconds))
 
     def build_argv(self, req: ExecRequest) -> list[str]:
         if not self.binary:
@@ -209,6 +262,7 @@ class AgyExecutor(ExecutionEngine):
 
         conversation = request.resume_conversation_id
         result: dict[str, Any] | None = None
+        unreadable = 0
         cancelled = hard_timeout = False
         deadline = started + request.timeout_seconds + DEADLINE_SLACK_SECONDS
         stdout_done = False
@@ -227,25 +281,37 @@ class AgyExecutor(ExecutionEngine):
                 stdout_done = True
                 continue
             line = line.strip()
+            if not line:
+                continue
             if not line.startswith("{"):
+                unreadable += 1
                 continue
             try:
                 event = json.loads(line)
             except json.JSONDecodeError:
+                unreadable += 1
+                continue
+            if not isinstance(event, dict):
+                unreadable += 1
                 continue
             kind = event.get("event")
             if kind == "init":
-                conversation = event.get("conversation_id") or conversation
+                conversation = _text(event.get("conversation_id")) or conversation
                 emit({"event": "init", "conversation_id": conversation})
             elif kind == "step_update":
-                step = event.get("step_update") or {}
-                if step.get("step_type") == "tool":
-                    emit({"event": "tool", "name": step.get("tool_name"), "state": step.get("state")})
+                step = event.get("step_update")
+                if not isinstance(step, dict):
+                    unreadable += 1
+                elif step.get("step_type") == "tool":
+                    emit({"event": "tool", "name": _text(step.get("tool_name")), "state": _text(step.get("state"))})
                 elif step.get("step_type") == "finish":
                     emit({"event": "finish"})
             elif kind == "result":
-                result = event.get("result") or {}
-                conversation = result.get("conversation_id") or conversation
+                result = _sanitize_result(event.get("result"))
+                if result is None:
+                    unreadable += 1
+                else:
+                    conversation = result.get("conversation_id") or conversation
         try:
             proc.wait(timeout=KILL_GRACE_SECONDS)
         except subprocess.TimeoutExpired:
@@ -255,21 +321,22 @@ class AgyExecutor(ExecutionEngine):
 
         stderr = "".join(stderr_chunks)
         status, classification, error = classify(proc.returncode, stderr, result, cancelled, hard_timeout)
+        if result is None and unreadable and classification == Classification.EXECUTOR_ERROR:
+            error = f"{error} ({unreadable} unreadable stream line(s); the output was corrupted or cut off)"
         report, report_problem = extract_report(result, workdir)
-        if status == ExecStatus.SUCCEEDED and report_problem:
+        if status == ExecStatus.SUCCEEDED and report_problem and request.report_schema:
             error = report_problem
         transcript = None
-        if conversation:
+        if conversation and re.fullmatch(r"[\w-]+", conversation):
             path = self.brain_dir / conversation / ".system_generated" / "logs" / "transcript.jsonl"
             transcript = str(path) if path.exists() else None
-        usage = (result or {}).get("usage")
         result_out = ExecResult(
             status=status,
             classification=classification,
             conversation_id=conversation,
             report=report,
             response_text=(result or {}).get("response") or "",
-            usage={k: int(v) for k, v in usage.items() if isinstance(v, (int, float))} if isinstance(usage, dict) else None,
+            usage=_usage((result or {}).get("usage")),
             denied_actions=_denied_names(result or {}),
             error=error,
             duration_seconds=round(time.monotonic() - started, 2),

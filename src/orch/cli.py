@@ -18,10 +18,12 @@ from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
-from orch import __version__, context, executors, plans, registry, review, skill, workflow
+from orch import __version__, commits, context, executors, plans, registry, review, skill, workflow
 from orch.config import ACTIONS, NEVER_AUTOMATIC, Config, default_config_text, load_config
 from orch.discovery import DiscoveryReport, discover
 from orch.errors import NotFoundError, OrchError, ValidationError
+from orch.executors.agy import AgyExecutor
+from orch.executors.base import Classification, ExecStatus
 from orch.models import Actor, Project, Task, TaskStatus
 from orch.paths import Paths, resolve_paths
 from orch.schema import SCHEMAS
@@ -220,6 +222,15 @@ def cmd_doctor(app: App) -> int:
     for name in executors.available():
         h = executors.get_executor(name).health()
         check(f"executor {name}", h.ok, h.detail, critical=False)
+        if h.version and h.verified_version:
+            same = h.version == h.verified_version
+            check(f"{name} version", same, f"{h.version} (verified)" if same else
+                  f"{h.version}; orch was verified against {h.verified_version}. {name} updates itself, so its "
+                  "output may have changed: try `orch doctor --probe`", critical=False)
+    probe: dict[str, Any] | None = None
+    if app.args.probe:
+        probe = _probe_agy(app)
+        check("agy account (probe)", probe["ok"], probe["detail"])
     try:
         stuck = [r for r in app.store.list_runs(status="running") if not workflow._alive(r["owner_pid"])]
         check("runs", not stuck, f"{len(stuck)} run(s) left by a stopped engine (orch recover)" if stuck else "no orphaned runs",
@@ -227,11 +238,38 @@ def cmd_doctor(app: App) -> int:
     except (OrchError, sqlite3.Error) as e:
         check("runs", False, str(e), critical=False)
     ok = all(c["ok"] for c in checks if c["critical"])
-    app.out({"ok": ok, "checks": checks}, lambda: table(
+    app.out({"ok": ok, "checks": checks, "probe": probe}, lambda: table(
         [["ok" if c["ok"] else ("FAIL" if c["critical"] else "warn"), c["check"], c["detail"]] for c in checks],
         ["", "check", "detail"],
     ))
     return 0 if ok else 1
+
+
+_PROBE_HINTS = {
+    Classification.ENV_BLOCKED: "a person has to fix the account, licence or location; retrying will not help",
+    Classification.TRANSIENT: "rate-limited or the service is unavailable; try again later",
+    Classification.TIMEOUT: "no answer in time; agy can be slow, so try again before suspecting the account",
+}
+
+
+def _probe_agy(app: App) -> dict[str, Any]:
+    """One tiny read-only agy turn in an empty directory (sends a short prompt, no code, to Google)."""
+    try:
+        model = app.config.get("executor", "model")
+    except OrchError:
+        model = None
+    if not app.args.json:
+        print("probing agy: one short request to Google, no repository content ...", file=sys.stderr, flush=True)
+    r = AgyExecutor().probe(model=model)
+    ok = r.status == ExecStatus.SUCCEEDED
+    if ok:
+        detail = f"signed in and working ({model or 'default model'}, {r.duration_seconds}s)"
+    else:
+        hint = _PROBE_HINTS.get(r.classification, "")
+        detail = f"{r.classification.value}: {r.error or r.status.value}" + (f" ({hint})" if hint else "")
+    return {"ok": ok, "detail": detail, "status": r.status.value, "classification": r.classification.value,
+            "error": r.error, "model": model, "duration_seconds": r.duration_seconds,
+            "conversation_id": r.conversation_id, "usage": r.usage}
 
 
 def cmd_config(app: App) -> int:
@@ -374,7 +412,34 @@ def cmd_task(app: App) -> int:
     elif a.task_cmd == "retry":
         t = review.retry(s, app.config, a.id, app.actor, a.reason)
         app.out(t.to_dict(), f"{t.id}: {t.status.value}" + (" (correction pending)" if t.review_status.value == "NEEDS_CORRECTION" else ""))
+    elif a.task_cmd == "commit":
+        message = None
+        if a.message_file:
+            message = sys.stdin.read() if a.message_file == "-" else Path(a.message_file).read_text(encoding="utf-8")
+        if a.dry_run:
+            plan = commits.prepare(s, app.config, a.ids, message)
+            app.out({**plan.to_dict(), "dry_run": True}, lambda: render_commit(plan, None))
+        else:
+            plan, sha = commits.create(s, app.config, a.ids, app.actor, message)
+            app.out({**plan.to_dict(), "commit": sha}, lambda: render_commit(plan, sha))
     return 0
+
+
+def render_commit(plan: commits.CommitPlan, sha: str | None) -> str:
+    if sha is None:
+        lines = [f"Would commit {len(plan.files)} file(s) on {plan.branch} (dry run, nothing changed):"]
+    else:
+        lines = [f"Committed {sha[:12]} on {plan.branch} ({len(plan.committed_files)} file(s)):"]
+    lines += [f"  {p}" for p in (plan.committed_files if sha else plan.files)]
+    if plan.already_committed:
+        lines.append("Already committed, unchanged: " + ", ".join(plan.already_committed))
+    lines += ["", "Message:", *[f"  {line}".rstrip() for line in plan.message.splitlines()], ""]
+    if sha is None:
+        lines.append(f"To commit: orch task commit {' '.join(plan.tasks)}  (needs the user unless policy makes "
+                     "git_commit automatic)")
+    else:
+        lines.append("Not pushed. Push the branch yourself when you are ready.")
+    return "\n".join(lines)
 
 
 def _progress_printer(app: App) -> workflow.ProgressCallback | None:
@@ -523,7 +588,9 @@ def build_parser() -> argparse.ArgumentParser:
     sub = p.add_subparsers(dest="cmd", required=True)
 
     sub.add_parser("init", help="create the config file and database")
-    sub.add_parser("doctor", help="check the environment")
+    dr = sub.add_parser("doctor", help="check the environment")
+    dr.add_argument("--probe", action="store_true",
+                    help="also run one tiny read-only agy turn to check the account works (sends a request to Google)")
     c = sub.add_parser("config", help="show the effective configuration")
     c.add_argument("config_cmd", nargs="?", choices=["show", "path"], default="show")
     sc = sub.add_parser("schema", help="print a data-contract JSON schema")
@@ -603,6 +670,12 @@ def build_parser() -> argparse.ArgumentParser:
         x = tk.add_parser(name, help=helptext)
         x.add_argument("id")
         x.add_argument("--reason", required=True)
+
+    x = tk.add_parser("commit", help="commit approved tasks' own files (needs the user unless policy makes "
+                                     "git_commit automatic); never pushes")
+    x.add_argument("ids", nargs="+", metavar="id", help="one or more APPROVED tasks of the same project")
+    x.add_argument("--dry-run", action="store_true", help="show the files and the message without committing")
+    x.add_argument("--message-file", help="use this commit message instead of the generated one ('-' for stdin)")
 
     rn = sub.add_parser("run", help="dispatch READY tasks to the executor and collect evidence")
     rn.add_argument("--task", action="append", help="only these tasks (repeatable)")

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "orch"
-version = "0.3.1"
+version = "0.4.0"
 description = "Claude plans and reviews, Antigravity builds, evidence decides: a local engineering orchestration engine."
 readme = "README.md"
 requires-python = ">=3.11"
