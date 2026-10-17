@@ -1,0 +1,44 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "orch"
+version = "0.3.0"
+description = "Claude plans and reviews, Antigravity builds, evidence decides: a local engineering orchestration engine."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = []
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "roohan" }]
+keywords = ["claude", "claude-code", "antigravity", "agents", "orchestration", "code-review", "automation"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "Operating System :: POSIX",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Topic :: Software Development :: Quality Assurance",
+    "Topic :: Software Development :: Testing",
+]
+
+[project.urls]
+Homepage = "https://github.com/federicoalbanese/orch"
+Issues = "https://github.com/federicoalbanese/orch/issues"
+Changelog = "https://github.com/federicoalbanese/orch/blob/main/CHANGELOG.md"
+
+[project.scripts]
+orch = "orch.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+orch = ["resources/*.md", "resources/claude/skills/*/SKILL.md"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+addopts = "-q"

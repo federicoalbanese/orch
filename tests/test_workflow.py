@@ -1,0 +1,381 @@
+import json
+import threading
+import time
+from pathlib import Path
+
+import pytest
+
+from orch import evidence, plans, registry, review, workflow
+from orch.errors import PolicyError, ValidationError
+from orch.executors.base import Classification, ExecStatus
+from orch.executors.fake import FakeExecutor, FakeStep
+from orch.models import ReviewDecision, TaskStatus
+from orch.redact import redact, truncate_middle
+from orch.store import Store
+
+from conftest import all_tools, git, plan_dict, task_dict
+
+CALC = "def add(a, b):\n    return a - b\n"
+GOOD = "def add(a, b):\n    return a + b\n"
+DONE = {"status": "DONE", "files_changed": ["calc.py"], "summary": "fixed add", "unresolved": []}
+
+
+@pytest.fixture
+def calc(store, paths, make_repo):
+    """A tiny repo with a bug, a confirmed check, opted in, on a working branch."""
+    root = make_repo("calc", {"calc.py": CALC, "pyproject.toml": "[project]\nname='calc'\n", "README.md": "# calc\n"})
+    git(root, "switch", "-q", "-c", "work")
+    p, _ = registry.add_project(store, paths, root, "user", which=all_tools)
+    registry.set_command(store, p.id, "test", "python3 -c 'import calc; assert calc.add(2, 3) == 5'", "user",
+                         timeout_seconds=60, confirm=True)
+    registry.remove_command(store, p.id, "lint", "user") if "lint" in store.get_project(p.id).commands else None
+    registry.set_engine(store, p.id, True, "user")
+    registry.set_field(store, p.id, "executor", "fake", "user")
+    return store.get_project(p.id)
+
+
+def calc_task(key="T1", **kw):
+    t = task_dict(key, scope={"allow": ["calc.py", "test_calc.py"]}, relevant_files=["calc.py"],
+                  acceptance=[{"id": "A1", "text": "add() adds", "verify": {"kind": "command", "command": "test"}},
+                              {"id": "A2", "text": "a regression test exists", "verify": {"kind": "review"}}])
+    t.update(kw)
+    return t
+
+
+def import_tasks(store, cfg, project, *tasks):
+    return [t.id for t in plans.import_plan(store, cfg, plan_dict(project.id, list(tasks)), "claude").tasks]
+
+
+def engine(store, paths, cfg, ex, **kw):
+    return workflow.Engine(store, paths, cfg, executor_factory=lambda name: ex, sleep=lambda s: None,
+                           cancel_poll_seconds=0.05, **kw)
+
+
+def review_doc(decision, met=True, findings=None, summary="looks right"):
+    return {"decision": decision, "summary": summary,
+            "criteria": [{"id": "A1", "met": met, "evidence": "test passed"}, {"id": "A2", "met": met}],
+            "findings": findings or []}
+
+
+def test_full_loop_with_a_correction_cycle(store, paths, cfg, calc):
+    t1, t2 = import_tasks(store, cfg, calc, calc_task("T1"), calc_task("T2", depends_on=["T1"]))
+    ex = FakeExecutor({t1: [
+        FakeStep(files={"calc.py": GOOD}, report=DONE, usage={"input_tokens": 100}),
+        FakeStep(files={"test_calc.py": "from calc import add\n\ndef test_add():\n    assert add(2, 3) == 5\n"},
+                 report={**DONE, "files_changed": ["test_calc.py"]}),
+    ]})
+    eng = engine(store, paths, cfg, ex)
+
+    out = eng.dispatch(t1)
+    assert out.status == "IN_REVIEW" and out.checks[0]["passed"]
+    first_prompt = ex.requests[0].prompt
+    assert "Framework rules" in first_prompt and "Allowed scope" in first_prompt and "engine itself runs: test" in first_prompt
+
+    bundle = review.build_bundle(store, cfg, t1)
+    ev = bundle["evidence"]
+    assert ev["changed_files"] == ["calc.py"] and ev["scope_violations"] == [] and bundle["approval_blockers"] == []
+    assert "-    return a - b" in ev["patch"] and "+    return a + b" in ev["patch"]
+    assert "Checks run by the engine" in review.render_bundle(bundle)
+
+    with pytest.raises(PolicyError, match="criterion A2 is marked unmet"):
+        review.decide(store, cfg, t1, review_doc("APPROVED", met=False), "claude")
+    finding = {"severity": "major", "category": "tests", "message": "no regression test",
+               "instruction": "Add test_calc.py with a pytest test for add(2, 3) == 5."}
+    task, _ = review.decide(store, cfg, t1, {**review_doc("NEEDS_CORRECTION"), "criteria": [
+        {"id": "A1", "met": True}, {"id": "A2", "met": False}], "findings": [finding]}, "claude")
+    assert task.status == TaskStatus.READY and task.review_status == ReviewDecision.NEEDS_CORRECTION
+    assert [t.id for t in store.ready_tasks()] == [t1]  # T2 still waits for T1's approval
+
+    out = eng.dispatch(t1)
+    assert out.status == "IN_REVIEW"
+    correction = ex.requests[1]
+    assert correction.resume_conversation_id == "fake-1"
+    assert "The original task (still fully in force)" in correction.prompt and "Add test_calc.py" in correction.prompt
+    assert "[A1] add() adds" in correction.prompt and "Allowed scope" in correction.prompt
+    ev = review.build_bundle(store, cfg, t1)["evidence"]
+    assert ev["changed_files"] == ["calc.py", "test_calc.py"]  # cumulative since the task started
+    assert ev["attempt_changed_files"] == ["test_calc.py"]
+
+    task, _ = review.decide(store, cfg, t1, review_doc("APPROVED"), "claude")
+    assert task.status == TaskStatus.APPROVED and task.review_status == ReviewDecision.APPROVED
+    assert [t.id for t in store.ready_tasks()] == [t2]
+    kinds = [r["kind"] for r in store.list_runs(t1)]
+    assert kinds == ["execute", "correction"]
+    assert review.build_bundle(store, cfg, t1)["usage_total"] == {"input_tokens": 100}
+
+
+def test_auto_fix_loop_runs_without_review(store, paths, cfg, calc):
+    (tid,) = import_tasks(store, cfg, calc, calc_task())
+    ex = FakeExecutor([FakeStep(files={"calc.py": "def add(a, b):\n    return a * b\n"}, report=DONE),
+                       FakeStep(files={"calc.py": GOOD}, report=DONE)])
+    out = engine(store, paths, cfg, ex).dispatch(tid)
+    assert out.status == "IN_REVIEW" and out.checks[0]["passed"]
+    assert [r["kind"] for r in store.list_runs(tid)] == ["execute", "auto_fix"]
+    assert "Checks failed" in ex.requests[1].prompt and "AssertionError" in ex.requests[1].prompt
+    assert ex.requests[1].resume_conversation_id == "fake-1"
+
+
+def test_auto_fix_stops_at_its_limit(store, paths, cfg, calc):
+    (tid,) = import_tasks(store, cfg, calc, calc_task())
+    bad = FakeStep(files={"calc.py": "def add(a, b):\n    return 0\n"}, report=DONE)
+    out = engine(store, paths, cfg, FakeExecutor([bad, bad, bad, bad])).dispatch(tid)
+    assert out.status == "IN_REVIEW" and not out.checks[0]["passed"]
+    assert len(store.list_runs(tid)) == 1 + cfg.get("limits", "auto_fix_attempts")
+    blockers = review.build_bundle(store, cfg, tid)["approval_blockers"]
+    assert any("check test failed" in b for b in blockers)
+    with pytest.raises(ValidationError, match="cannot be met"):
+        review.decide(store, cfg, tid, review_doc("APPROVED"), "claude")
+
+
+def test_scope_violation_blocks_approval_and_auto_fix(store, paths, cfg, calc):
+    (tid,) = import_tasks(store, cfg, calc, calc_task())
+    ex = FakeExecutor([FakeStep(files={"calc.py": "x = (", "README.md": "# changed\n"}, report=DONE)])
+    out = engine(store, paths, cfg, ex).dispatch(tid)
+    assert out.status == "IN_REVIEW" and len(store.list_runs(tid)) == 1  # no auto-fix with a scope violation
+    ev = review.build_bundle(store, cfg, tid)["evidence"]
+    assert ev["scope_violations"] == ["README.md"]
+    assert ev["discrepancies"]["changed_not_claimed"] == ["README.md"]
+
+
+def test_policy_flag_needs_human_approval(store, paths, cfg, calc):
+    (tid,) = import_tasks(store, cfg, calc, calc_task(scope={"allow": ["calc.py", "pyproject.toml"]}))
+    task = store.get_task(tid)
+    assert task.status == TaskStatus.AWAITING_APPROVAL and "dependency_change" in task.approval_reasons[0]
+    plans.approve_task(store, tid, "user", "a dependency edit is expected")
+    ex = FakeExecutor([FakeStep(files={"calc.py": GOOD, "pyproject.toml": "[project]\nname='calc2'\n"}, report=DONE)])
+    engine(store, paths, cfg, ex).dispatch(tid)
+    with pytest.raises(PolicyError, match="NEEDS_HUMAN_APPROVAL"):
+        review.decide(store, cfg, tid, review_doc("APPROVED"), "claude")
+    task, _ = review.decide(store, cfg, tid, review_doc("NEEDS_HUMAN_APPROVAL"), "claude")
+    assert task.status == TaskStatus.NEEDS_HUMAN_APPROVAL
+    with pytest.raises(PolicyError):
+        review.accept(store, tid, "claude", "fine")
+    assert review.accept(store, tid, "user", "dependency change is intended").status == TaskStatus.APPROVED
+
+
+def test_review_cycle_limit_escalates(store, paths, cfg, calc):
+    (tid,) = import_tasks(store, cfg, calc, calc_task())
+    ex = FakeExecutor([FakeStep(files={"calc.py": GOOD + f"# v{i}\n"}, report=DONE) for i in range(6)])
+    eng = engine(store, paths, cfg, ex)
+    fix = [{"severity": "minor", "category": "quality", "message": "m", "instruction": "do better"}]
+    for cycle in range(1, cfg.get("limits", "max_review_cycles") + 1):
+        eng.dispatch(tid)
+        task, _ = review.decide(store, cfg, tid, review_doc("NEEDS_CORRECTION", findings=fix), "claude")
+    assert task.status == TaskStatus.FAILED
+    assert any(e["kind"] == "task.escalated" for e in store.list_events(subject_type="task", subject_id=tid))
+    with pytest.raises(PolicyError):
+        review.retry(store, cfg, tid, "claude", "try again")
+    task = review.retry(store, cfg, tid, "user", "one more go")
+    assert task.status == TaskStatus.READY and store.task_extras(tid)["review_cycles"] == 0
+    assert task.review_status == ReviewDecision.NEEDS_CORRECTION
+
+
+def test_review_validation(store, paths, cfg, calc):
+    (tid,) = import_tasks(store, cfg, calc, calc_task())
+    with pytest.raises(PolicyError, match="not IN_REVIEW"):
+        review.decide(store, cfg, tid, review_doc("APPROVED"), "claude")
+    engine(store, paths, cfg, FakeExecutor([FakeStep(files={"calc.py": GOOD}, report=DONE)])).dispatch(tid)
+    with pytest.raises(PolicyError, match="never by the engine"):
+        review.decide(store, cfg, tid, review_doc("APPROVED"), "engine")
+    doc = review_doc("APPROVED")
+    doc["criteria"] = doc["criteria"][:1] + [{"id": "Z9", "met": True}]
+    with pytest.raises(ValidationError) as e:
+        review.decide(store, cfg, tid, doc, "claude")
+    assert "A2 is not addressed" in str(e.value) and "unknown criterion Z9" in str(e.value)
+    with pytest.raises(ValidationError, match="instruction"):
+        review.decide(store, cfg, tid, review_doc("NEEDS_CORRECTION", findings=[
+            {"severity": "minor", "category": "quality", "message": "vague"}]), "claude")
+    with pytest.raises(PolicyError, match="open major finding"):
+        review.decide(store, cfg, tid, review_doc("APPROVED", findings=[
+            {"severity": "major", "category": "security", "message": "sql injection"}]), "claude")
+
+
+def test_transient_failures_retry_with_backoff(store, paths, cfg, calc):
+    (tid,) = import_tasks(store, cfg, calc, calc_task())
+    slept = []
+    ex = FakeExecutor([FakeStep(status=ExecStatus.FAILED, classification=Classification.TRANSIENT, error="429"),
+                       FakeStep(files={"calc.py": GOOD}, report=DONE)])
+    eng = workflow.Engine(store, paths, cfg, executor_factory=lambda n: ex, sleep=slept.append, cancel_poll_seconds=0.05)
+    assert eng.dispatch(tid).status == "IN_REVIEW"
+    assert slept == [cfg.get("limits", "retry_backoff_seconds")]
+    assert [r["kind"] for r in store.list_runs(tid)] == ["execute", "retry"]
+
+
+def test_environment_errors_fail_and_escalate(store, paths, cfg, calc):
+    (tid,) = import_tasks(store, cfg, calc, calc_task())
+    ex = FakeExecutor([FakeStep(status=ExecStatus.ENV_BLOCKED, classification=Classification.ENV_BLOCKED,
+                                error="eligibility check failed")])
+    out = engine(store, paths, cfg, ex).dispatch(tid)
+    assert out.status == "FAILED" and "eligibility" in out.message
+    assert any(e["kind"] == "task.escalated" for e in store.list_events(subject_type="task", subject_id=tid))
+    assert review.retry(store, cfg, tid, "claude", "account issue resolved").status == TaskStatus.READY
+
+
+def test_denied_without_changes_is_retried_once(store, paths, cfg, calc):
+    (tid,) = import_tasks(store, cfg, calc, calc_task())
+    denied = FakeStep(status=ExecStatus.DENIED, classification=Classification.PERMISSION, denied_actions=["RunCommand"])
+    ex = FakeExecutor([denied, FakeStep(files={"calc.py": GOOD}, report=DONE)])
+    assert engine(store, paths, cfg, ex).dispatch(tid).status == "IN_REVIEW"
+    assert "edit files only" in ex.requests[1].prompt or "editing files only" in ex.requests[1].prompt
+
+
+def test_cancel_stops_a_running_task(store, paths, cfg, calc):
+    (tid,) = import_tasks(store, cfg, calc, calc_task())
+    ex = FakeExecutor([FakeStep(delay=10, files={"calc.py": GOOD})])
+
+    def cancel_soon():
+        time.sleep(0.4)
+        s = Store(paths.db_file)
+        s.transition_task(tid, TaskStatus.CANCELLED, "user", "changed my mind")
+        s.close()
+
+    threading.Thread(target=cancel_soon).start()
+    started = time.monotonic()
+    out = engine(store, paths, cfg, ex).dispatch(tid)
+    assert out.status == "CANCELLED" and time.monotonic() - started < 5
+    assert store.list_runs(tid)[0]["status"] == "cancelled"
+    assert Path(calc.root, "calc.py").read_text() == CALC
+
+
+def test_preflight_dirty_scope_and_automatic_branch(store, paths, cfg, calc):
+    root = Path(calc.root)
+    git(root, "switch", "-q", "main")
+    (root / "notes.txt").write_text("my own uncommitted work\n")
+    (tid,) = import_tasks(store, cfg, calc, calc_task())
+    out = engine(store, paths, cfg, FakeExecutor([FakeStep(files={"calc.py": GOOD}, report=DONE)])).dispatch(tid)
+    assert out.status == "IN_REVIEW"
+    assert git(root, "branch", "--show-current") == "orch/P1"
+    ev = review.build_bundle(store, cfg, tid)["evidence"]
+    assert ev["changed_files"] == ["calc.py"] and ev["new_branch"] == "orch/P1"  # notes.txt is not attributed
+    assert (root / "notes.txt").read_text() == "my own uncommitted work\n"
+
+    (t2,) = import_tasks(store, cfg, calc, calc_task("T9"))
+    with pytest.raises(PolicyError, match="uncommitted changes inside the task's scope"):
+        engine(store, paths, cfg, FakeExecutor([])).dispatch(t2)
+    assert store.get_task(t2).status == TaskStatus.READY
+
+
+def test_snapshot_never_touches_the_users_index(calc):
+    root = Path(calc.root)
+    (root / "calc.py").write_text(GOOD)
+    git(root, "add", "calc.py")
+    (root / "new.txt").write_text("untracked\n")
+    status = git(root, "status", "--porcelain")
+    snap = evidence.snapshot(root)
+    assert git(root, "status", "--porcelain") == status
+    assert snap.dirty == ["calc.py", "new.txt"]
+    assert "new.txt" in git(root, "ls-tree", "--name-only", snap.tree)
+
+
+def test_recover_interrupts_orphaned_runs(store, paths, cfg, calc):
+    (tid,) = import_tasks(store, cfg, calc, calc_task())
+    store.transition_task(tid, TaskStatus.RUNNING, "engine", "dispatch", updates={"attempt": 1})
+    run_id = store.insert_run(tid, 1, "execute", "fake", owner_pid=999_999_999)
+    report = workflow.recover(store, "user")
+    assert report == [{"run": run_id, "task_id": tid, "result": "interrupted"}]
+    assert store.get_task(tid).status == TaskStatus.INTERRUPTED
+    assert store.get_run(run_id)["status"] == "interrupted"
+
+
+def test_scheduler_honours_dependencies_and_concurrency(store, paths, cfg, calc, make_repo):
+    other_root = make_repo("other", {"calc.py": CALC})
+    git(other_root, "switch", "-q", "-c", "work")
+    other, _ = registry.add_project(store, paths, other_root, "user", which=all_tools)
+    registry.set_command(store, other.id, "test", "python3 -c 'import calc; assert calc.add(2, 3) == 5'", "user",
+                         confirm=True)
+    registry.set_field(store, other.id, "executor", "fake", "user")
+    a1, a2 = import_tasks(store, cfg, calc, calc_task("T1"), calc_task("T2", depends_on=["T1"]))
+    (b1,) = import_tasks(store, cfg, store.get_project(other.id), calc_task("T1"))
+    lock = threading.Lock()
+    ex = FakeExecutor([FakeStep(files={"calc.py": GOOD}, report=DONE, delay=0.2) for _ in range(5)])
+
+    def factory(name):
+        with lock:
+            return ex
+
+    results = workflow.run_ready(paths, cfg, executor_factory=factory, sleep=lambda s: None)
+    by_task = {r["task_id"]: r["status"] for r in results}
+    assert by_task == {a1: "IN_REVIEW", b1: "IN_REVIEW"}  # a2 waits for a1's approval
+    assert store.get_task(a2).status == TaskStatus.READY
+
+
+def test_unopted_project_is_skipped_by_the_scheduler(store, paths, cfg, calc):
+    registry.set_engine(store, calc.id, False, "user")
+    registry.set_field(store, calc.id, "executor", "agy", "user")
+    (tid,) = import_tasks(store, cfg, calc, calc_task())
+    results = workflow.run_ready(paths, cfg)
+    assert results[0]["status"] == "SKIPPED" and "external_engine_not_allowed" in results[0]["message"]
+    results = workflow.run_ready(paths, cfg, executor_override="agy")
+    assert results[0]["status"] == "SKIPPED"
+
+
+def test_redaction_and_truncation():
+    text = ("token=abcd1234efgh ghp_" + "a" * 30 + " https://u:p4ss@host/x Authorization: Bearer xyz.abc\n"
+            "-----BEGIN RSA PRIVATE KEY-----\nAAA\n-----END RSA PRIVATE KEY-----\nAKIAABCDEFGHIJKLMNOP")
+    out = redact(text)
+    for secret in ("abcd1234efgh", "ghp_aaaa", "p4ss", "xyz.abc", "AAA", "AKIAABCDEFGHIJKLMNOP"):
+        assert secret not in out
+    assert "token=[REDACTED]" in out
+    short, cut = truncate_middle("a" * 100 + "END", 40)
+    assert cut and short.endswith("END") and "omitted" in short
+
+
+def test_dependent_task_builds_on_approved_uncommitted_work(store, paths, cfg, calc):
+    t1, t2 = import_tasks(store, cfg, calc, calc_task("T1"), calc_task("T2", depends_on=["T1"]))
+    tests_v1 = "from calc import add\n\ndef test_add():\n    assert add(2, 3) == 5\n"
+    ex = FakeExecutor({
+        t1: [FakeStep(files={"calc.py": GOOD}, report=DONE)],
+        t2: [FakeStep(files={"test_calc.py": tests_v1}, report={**DONE, "files_changed": ["test_calc.py"]})],
+    })
+    eng = engine(store, paths, cfg, ex)
+    eng.dispatch(t1)
+    review.decide(store, cfg, t1, review_doc("APPROVED"), "claude")
+
+    # T1's approved edit to calc.py is uncommitted and inside T2's scope: it is accounted for.
+    assert eng.dispatch(t2).status == "IN_REVIEW"
+    ev = review.build_bundle(store, cfg, t2)["evidence"]
+    assert ev["changed_files"] == ["test_calc.py"]  # T1's work is not attributed to T2
+
+
+def test_edits_after_approval_still_block(store, paths, cfg, calc):
+    t1, t2 = import_tasks(store, cfg, calc, calc_task("T1"), calc_task("T2", depends_on=["T1"]))
+    eng = engine(store, paths, cfg, FakeExecutor({t1: [FakeStep(files={"calc.py": GOOD}, report=DONE)]}))
+    eng.dispatch(t1)
+    review.decide(store, cfg, t1, review_doc("APPROVED"), "claude")
+    Path(calc.root, "calc.py").write_text(GOOD + "# my own tweak\n")
+    with pytest.raises(PolicyError, match="calc.py"):
+        eng.dispatch(t2)
+
+
+class CumulativeFake(FakeExecutor):
+    """Reports usage as a running total per conversation, like agy."""
+
+    def __init__(self, steps):
+        super().__init__(steps)
+        self.totals: dict[str, int] = {}
+
+    def capabilities(self):
+        import dataclasses
+        return dataclasses.replace(super().capabilities(), cumulative_usage=True)
+
+    def run(self, request, cancel=None, on_event=None):
+        result = super().run(request, cancel, on_event)
+        conv = result.conversation_id
+        self.totals[conv] = self.totals.get(conv, 0) + (result.usage or {}).get("input_tokens", 0)
+        result.usage = {"input_tokens": self.totals[conv]}
+        return result
+
+
+def test_cumulative_usage_is_recorded_per_run(store, paths, cfg, calc):
+    assert workflow.usage_delta({"a": 5}, {"a": 12, "b": 3}) == {"a": 7, "b": 3}
+    assert workflow.usage_delta(None, {"a": 1}) == {"a": 1} and workflow.usage_delta({"a": 1}, None) is None
+    (tid,) = import_tasks(store, cfg, calc, calc_task())
+    ex = CumulativeFake([FakeStep(files={"calc.py": GOOD}, report=DONE, usage={"input_tokens": 100}),
+                        FakeStep(files={"test_calc.py": "x = 1\n"}, report=DONE, usage={"input_tokens": 30})])
+    eng = engine(store, paths, cfg, ex)
+    eng.dispatch(tid)
+    review.decide(store, cfg, tid, review_doc("NEEDS_CORRECTION", findings=[
+        {"severity": "minor", "category": "tests", "message": "m", "instruction": "add a test"}]), "claude")
+    eng.dispatch(tid)
+    assert [r["usage"] for r in store.list_runs(tid)] == [{"input_tokens": 100}, {"input_tokens": 30}]
+    assert review.build_bundle(store, cfg, tid)["usage_total"] == {"input_tokens": 130}
