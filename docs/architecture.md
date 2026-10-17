@@ -59,10 +59,10 @@ all hosted on self-hosted GitLab rather than GitHub. Three facts follow:
 | Audit trail | ✅ Verified | Full tool-call transcript at `~/.gemini/antigravity-cli/brain/<conversation-id>/.system_generated/logs/transcript.jsonl` |
 | Model choice | ✅ Verified | `--model`. `agy models` lists the models available to the account |
 | Read-only config queries | ✅ Verified | `agy -p "/permissions"` answers from configuration: no agent turn, no quota, no conversation |
-| Run shell commands (tests, builds) headless | ❌ **Blocked** | Always auto-denied (`denied_actions: RunCommand`) in every mode tried |
+| Run shell commands (tests, builds) headless | ❌ **Blocked without a grant** | Auto-denied (`denied_actions: RunCommand`) in every mode tried, unless an allow-rule covers the command (scoped allow-rules, below) |
 | `--mode auto` | ❌ Unavailable | "not available for this account" on the account tested |
 | `--sandbox` | ❌ No effect | Commands still denied |
-| Scoped command allow-rules | ⚠️ **Format verified; headless effect not verified** | `command(<prefix>)` rules in `permissions.allow` (global `settings.json`) are read by `agy`, and match commands by prefix. Whether they take effect in headless `request-review` mode needs a live turn and a change to the user's `agy` config, so it waits for the user's OK. Findings: [agy-command-grants.md](agy-command-grants.md) |
+| Scoped command allow-rules | ✅ **Verified headless** (live test, 2026-10-17, `agy` 1.4.0) | A global `command(<prefix>)` rule in `permissions.allow` (`settings.json`) let a headless `request-review` run execute the granted command. A command with no rule was still denied. Rules match by prefix, outlive tasks and bypass `agy`'s sandbox, so orch doesn't use them. The project-scope format is still unconfirmed. Findings: [agy-command-grants.md](agy-command-grants.md) |
 | `--dangerously-skip-permissions` | 🚫 Rejected by policy | Grants everything; incompatible with least privilege |
 | Desktop app API | ❌ None found | Not used |
 
@@ -83,7 +83,7 @@ all hosted on self-hosted GitLab rather than GitHub. Three facts follow:
 
 ### 2.4 The decision these facts force
 
-`agy` cannot run tests or builds unattended. So **the engine runs every verification command itself**, and feeds failures back to `agy` through `--conversation`. The review rules require this anyway: test evidence must come from a run the engine captured, not from the executor's claim. Letting `agy` run its own commands becomes an optional capability once scoped grants are tested.
+`agy` cannot run tests or builds unattended. So **the engine runs every verification command itself**, and feeds failures back to `agy` through `--conversation`. The review rules require this anyway: test evidence must come from a run the engine captured, not from the executor's claim. Scoped grants do work headless, so letting `agy` run its own commands could become an opt-in capability. orch doesn't offer it yet.
 
 ---
 
@@ -127,7 +127,7 @@ all hosted on self-hosted GitLab rather than GitHub. Three facts follow:
 |---|---|---|
 | Claude (skill) | Understanding, inspection, architecture, task breakdown, acceptance criteria, review decisions, correction instructions, decision records | Bookkeeping, running tests by hand, trusting the executor's claims |
 | Engine | State machine, persistence, policy enforcement, scheduling, dispatch, snapshots, diffs, scope checks, verification runs, retries, audit log, redaction | Making design decisions; running commands that came from model output |
-| Executor (`agy`) | Implementing a task within its declared scope; reporting through the schema | Redefining scope or architecture; running commands (until grants exist) |
+| Executor (`agy`) | Implementing a task within its declared scope; reporting through the schema | Redefining scope or architecture; running commands (orch grants it none) |
 
 ### 3.3 Data contracts (JSON Schema, versioned)
 
@@ -267,7 +267,7 @@ Rules:
 | R1 | An `agy` self-update changes its CLI or output | The adapter isolates it and parses defensively; contract tests replay recorded and corrupted output; `orch doctor` warns when the version differs from the verified one |
 | R2 | The Google account is rate-limited, unlicensed, or not eligible (429/403/400) | Back off on 429; classify the others as `ENV_BLOCKED` and escalate; nothing is half-applied; `orch doctor --probe` checks the account on request |
 | R3 | **Employer or client source code is sent to Google** | `allow_external_engine` is off by default per project; only a person can opt a project in |
-| R4 | `agy` can't run tests itself, so it iterates more slowly | Engine-run verification plus the auto-fix loop. Scoped grants exist but are prefix-wide, outlive tasks and bypass `agy`'s sandbox; their headless effect is unverified, so orch does not use them ([findings](agy-command-grants.md)) |
+| R4 | `agy` can't run tests itself, so it iterates more slowly | Engine-run verification plus the auto-fix loop. Scoped grants work headless, but they are prefix-wide, outlive tasks and bypass `agy`'s sandbox, so orch does not use them ([findings](agy-command-grants.md)) |
 | R5 | Docker-based tests need running containers and are slow | Per-command `requires_services` and generous timeouts; starting services needs approval |
 | R6 | The executor edits outside scope or refactors unrelated code | Snapshot plus scope check: violations block approval and auto-fix. The engine never reverts work automatically |
 | R7 | Concurrent tasks collide in one working tree | One task per repository by default; scope-overlap checks |

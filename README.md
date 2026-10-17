@@ -204,7 +204,7 @@ orch is **alpha**. Phases 1 to 4 are done. Phase 3 was [validated live](docs/val
 
 Known limitations:
 
-- **Antigravity can't run shell commands in headless mode.** The engine runs every check and feeds failures back. `agy` has scoped command grants, but they are prefix-wide and their headless effect is unverified, so orch doesn't use them ([findings](docs/agy-command-grants.md)).
+- **Antigravity can't run shell commands in headless mode.** The engine runs every check and feeds failures back. `agy` has scoped command grants, and they work headless, but they are prefix-wide and outlive tasks, so orch doesn't use them ([findings](docs/agy-command-grants.md)).
 - **Token usage, not cost.** `agy` reports token usage but no cost.
 - **Pushes and merge requests are manual.** orch commits an approved task's files when you run `orch task commit`; pushing and opening MRs are up to you.
 - **Untested on Windows.**
