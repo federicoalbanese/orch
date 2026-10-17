@@ -3,10 +3,11 @@
 ## Unreleased
 
 **Fixed**
-- **Edits to ignored secrets show in the evidence.** Snapshots honour `.gitignore`, so an executor's change to a gitignored file such as `.env` was invisible to the evidence. orch now fingerprints the sensitive files outside git before and after every attempt.
+- **Edits to ignored secrets show in the evidence.** Snapshots honour `.gitignore`, so an executor's change to a gitignored file such as `.env` was invisible to the evidence. orch now fingerprints the gitignored sensitive files before and after every attempt. Untracked files that aren't ignored are already in the snapshots, so they aren't fingerprinted or reported twice.
   - The fingerprints are a sha256 and size per file, kept in memory and never stored.
   - A change is recorded as a `policy.ignored_sensitive_changed` audit event, even for runs that fail.
-  - It is listed in `orch review show`, and counts as a scope violation and a sensitive-file flag, so APPROVED is refused.
+  - It is listed in `orch review show`. Outside the task's scope it is a scope violation. In any case it raises a `secrets_change` flag, which can never be made automatic, so APPROVED is refused even when the scope allows the file.
+  - A directory with more than 2,000 files is not fingerprinted. It is listed as unchecked instead, in the evidence (`ignored_sensitive_unchecked`), in `orch review show` and in a `policy.ignored_sensitive_unchecked` event, so a new file in it can't push another file out and make it look deleted.
   - Changes you make yourself between runs are not attributed to the executor.
 
 ## 0.5.0 (2026-10-17)

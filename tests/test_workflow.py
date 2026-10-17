@@ -428,8 +428,8 @@ def test_fingerprints_see_what_git_ignores(tmp_path):
     (tmp_path / "outside.txt").write_text("not walked\n")
     (root / "secrets" / "link").symlink_to(tmp_path, target_is_directory=True)
     before = evidence.fingerprint(root, [".env", "secrets/", "missing/"])
-    assert sorted(before) == [".env", "secrets/nested/key.txt"]  # symlinked directories are not followed
-    assert all(v.startswith("sha256=") for v in before.values())
+    assert sorted(before.files) == [".env", "secrets/nested/key.txt"]  # symlinked directories are not followed
+    assert all(v.startswith("sha256=") for v in before.files.values()) and before.unchecked == []
     (root / ".env").write_text("A=2\n")
     (root / "secrets" / "nested" / "key.txt").unlink()
     (root / "secrets" / "new.pem").write_text("p\n")
@@ -501,3 +501,72 @@ def test_the_users_own_edits_to_ignored_files_between_runs_are_not_attributed(st
     assert ev["ignored_sensitive_changes"] == [] and ev["scope_violations"] == []
     task, _ = review.decide(store, cfg, tid, review_doc("APPROVED"), "claude")
     assert task.status == TaskStatus.APPROVED
+
+
+def test_a_directory_over_the_fingerprint_cap_is_left_unchecked(store, paths, cfg, calc, monkeypatch):
+    """The cap counted files across all paths, so a new file that sorted first pushed the last one out.
+
+    That file was reported as deleted, which blocked approval, and files past the cap went unchecked silently.
+    """
+    monkeypatch.setattr(evidence, "FINGERPRINT_MAX_FILES", 3)
+    root = Path(calc.root)
+    (root / ".gitignore").write_text(".env\nsecrets/\n")
+    git(root, "add", ".gitignore")
+    git(root, "commit", "-q", "-m", "ignore")
+    (root / ".env").write_text("A=1\n")
+    (root / "secrets").mkdir()
+    for name in ("b.txt", "c.txt", "d.txt"):
+        (root / "secrets" / name).write_text("token\n")
+    (tid,) = import_tasks(store, cfg, calc, calc_task())
+    ex = FakeExecutor([FakeStep(files={"calc.py": GOOD, "secrets/a.txt": "new\n"}, report=DONE)])
+    assert engine(store, paths, cfg, ex).dispatch(tid).status == "IN_REVIEW"
+    bundle = review.build_bundle(store, cfg, tid)
+    ev = bundle["evidence"]
+    assert ev["ignored_sensitive_changes"] == [] and ev["ignored_sensitive_unchecked"] == ["secrets/"]
+    assert bundle["approval_blockers"] == []
+    assert "Sensitive directories outside git not checked for changes (too many files): secrets/" \
+        in review.render_bundle(bundle)
+    events = [e for e in store.list_events(subject_type="task", subject_id=tid)
+              if e["kind"] == "policy.ignored_sensitive_unchecked"]
+    assert [e["data"]["paths"] for e in events] == [["secrets/"]]
+
+    # Other paths are still compared next to an unchecked directory.
+    (root / ".env").write_text("A=2\n")
+    after = evidence.fingerprint(root, evidence.ignored_secrets(root, cfg))
+    assert sorted(after.files) == [".env"] and after.unchecked == ["secrets/"]
+    before = evidence.Fingerprint(files={".env": "old", "secrets/b.txt": "x"})
+    assert evidence.fingerprint_changes(before, after) == [{"path": ".env", "change": "modified"}]
+
+
+def test_ignored_edits_need_a_person_even_when_sensitive_files_are_automatic(store, paths, cfg, calc):
+    """A project can make sensitive_file automatic; an edit that no diff can show must still go to a person."""
+    root = Path(calc.root)
+    _ignore_env(root)
+    auto = [*cfg.get("policy", "auto_actions"), "sensitive_file"]
+    registry.set_override(store, cfg, calc.id, "policy", "auto_actions", json.dumps(auto), "user")
+    (tid,) = import_tasks(store, cfg, calc, calc_task(scope={"allow": ["calc.py", "test_calc.py", ".env"]}))
+    assert store.get_task(tid).status == TaskStatus.READY
+    ex = FakeExecutor([FakeStep(files={"calc.py": GOOD, ".env": "DB_PASSWORD=x\n"}, report=DONE)])
+    out = engine(store, paths, cfg, ex).dispatch(tid)
+    assert out.status == "IN_REVIEW" and "needs human approval: secrets_change" in out.message
+    ev = review.build_bundle(store, cfg, tid)["evidence"]
+    assert ev["scope_violations"] == []
+    assert ev["policy_flags"] == [{"action": "secrets_change", "detail": ".env (modified, outside git)"}]
+    with pytest.raises(PolicyError, match="NEEDS_HUMAN_APPROVAL"):
+        review.decide(store, cfg, tid, review_doc("APPROVED"), "claude")
+    task, _ = review.decide(store, cfg, tid, review_doc("NEEDS_HUMAN_APPROVAL"), "claude")
+    assert task.status == TaskStatus.NEEDS_HUMAN_APPROVAL
+
+
+def test_untracked_sensitive_files_are_reported_once(store, paths, cfg, calc):
+    """An untracked .env.local that isn't ignored is in the snapshots already, so it isn't fingerprinted too."""
+    root = Path(calc.root)
+    (root / ".env.local").write_text("A=1\n")
+    assert evidence.readable_secrets(root, cfg) == [".env.local"] and evidence.ignored_secrets(root, cfg) == []
+    (tid,) = import_tasks(store, cfg, calc, calc_task())
+    ex = FakeExecutor([FakeStep(files={"calc.py": GOOD, ".env.local": "A=2\n"}, report=DONE)])
+    assert engine(store, paths, cfg, ex).dispatch(tid).status == "IN_REVIEW"
+    ev = review.build_bundle(store, cfg, tid)["evidence"]
+    assert ev["changed_files"] == [".env.local", "calc.py"] and ev["ignored_sensitive_changes"] == []
+    assert ev["scope_violations"] == [".env.local"]
+    assert ev["policy_flags"] == [{"action": "sensitive_file", "detail": ".env.local"}]

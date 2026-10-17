@@ -101,6 +101,9 @@ def render_bundle(b: dict[str, Any]) -> str:
         if ev.get("ignored_sensitive_changes"):
             lines.append("Sensitive files outside git that the executor changed (git can't show them): "
                          + ", ".join(f"{c['path']} ({c['change']})" for c in ev["ignored_sensitive_changes"]))
+        if ev.get("ignored_sensitive_unchecked"):
+            lines.append("Sensitive directories outside git not checked for changes (too many files): "
+                         + ", ".join(ev["ignored_sensitive_unchecked"]))
         if ev.get("check_artifacts"):
             lines.append("Created by the engine's checks (not attributed to the executor): "
                          + ", ".join(ev["check_artifacts"][:20]))

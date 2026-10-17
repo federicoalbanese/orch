@@ -31,7 +31,7 @@ from orch.policy import classify_paths, is_protected_branch
 from orch.redact import redact, truncate_middle
 
 SNAPSHOT_TIMEOUT = 300.0
-FINGERPRINT_MAX_FILES = 2000
+FINGERPRINT_MAX_FILES = 2000  # per directory; a larger one is listed as unchecked instead
 FINGERPRINT_MAX_BYTES = 64 * 1024 * 1024
 
 
@@ -66,45 +66,76 @@ def dirty_paths(root: Path) -> list[str]:
     return sorted(set(paths))
 
 
+def _sensitive_outside_git(root: Path, cfg: Config, codes: tuple[str, ...]) -> list[str]:
+    rc, out = gitutil.run_git(root, "status", "--porcelain=v1", "-z", "--ignored", "--untracked-files=normal",
+                              strip=False)
+    if rc != 0:
+        return []
+    outside = [e[3:] for e in out.split("\0") if e[:3] in codes]
+    return sorted(globs.matching(outside, cfg.get("policy", "sensitive_globs")))
+
+
 def readable_secrets(root: Path, cfg: Config) -> list[str]:
     """Files outside git (untracked or ignored) that match the sensitive globs.
 
     An executor can read any file in the working tree, not only tracked code, so
     opting a project in to an external engine can send these off the machine too
-    (a gitignored `.env`, for example). Snapshots honour .gitignore, so evidence
-    can't show these files either. Untracked and ignored directories are checked
+    (a gitignored `.env`, for example). Untracked and ignored directories are checked
     as git reports them, collapsed (`secrets/`), not file by file.
     """
-    rc, out = gitutil.run_git(root, "status", "--porcelain=v1", "-z", "--ignored", "--untracked-files=normal",
-                              strip=False)
-    if rc != 0:
-        return []
-    outside = [e[3:] for e in out.split("\0") if e[:3] in ("?? ", "!! ")]
-    return sorted(globs.matching(outside, cfg.get("policy", "sensitive_globs")))
+    return _sensitive_outside_git(root, cfg, ("?? ", "!! "))
 
 
-def fingerprint(root: Path, paths: list[str]) -> dict[str, str]:
+def ignored_secrets(root: Path, cfg: Config) -> list[str]:
+    """The gitignored ones among readable_secrets: snapshots honour .gitignore, so no diff can show them.
+
+    Untracked files that aren't ignored are left out, because snapshots already include them.
+    """
+    return _sensitive_outside_git(root, cfg, ("!! ",))
+
+
+@dataclass
+class Fingerprint:
+    """Files git can't see, as they are now (see fingerprint). Kept in memory only, never stored."""
+
+    files: dict[str, str] = field(default_factory=dict)
+    unchecked: list[str] = field(default_factory=list)  # directories with more than FINGERPRINT_MAX_FILES files
+
+
+def _files_under(base: Path) -> list[Path] | None:
+    """Every file below a directory, without following symlinks; None once there are more than FINGERPRINT_MAX_FILES."""
+    files: list[Path] = []
+    for d, dirs, names in os.walk(base):
+        dirs.sort()
+        files += [Path(d, n) for n in sorted(names)]
+        if len(files) > FINGERPRINT_MAX_FILES:
+            return None
+    return files
+
+
+def fingerprint(root: Path, paths: list[str]) -> Fingerprint:
     """A fingerprint of each regular file at or under `paths`, to notice changes git can't see.
 
     Kept in memory only, never stored: a hash of a short secret could be guessed back. Directories
-    are walked without following symlinks, up to FINGERPRINT_MAX_FILES files in all; files larger
-    than FINGERPRINT_MAX_BYTES are compared by size and modification time instead of content.
+    are walked without following symlinks. One with more than FINGERPRINT_MAX_FILES files is not
+    fingerprinted at all but listed as unchecked, so what gets compared never depends on which files
+    sort first. Files larger than FINGERPRINT_MAX_BYTES are compared by size and modification time
+    instead of content.
     """
-    prints: dict[str, str] = {}
+    fp = Fingerprint()
     for rel in paths:
         base = root / rel.rstrip("/")
         if base.is_file():
             files = [base]
         elif base.is_dir():
-            files = []
-            for d, dirs, names in os.walk(base):
-                dirs.sort()
-                files += [Path(d, n) for n in sorted(names)]
+            walked = _files_under(base)
+            if walked is None:
+                fp.unchecked.append(rel.rstrip("/") + "/")
+                continue
+            files = walked
         else:
             continue
         for f in files:
-            if len(prints) >= FINGERPRINT_MAX_FILES:
-                return prints
             try:
                 st = f.stat()
                 if not stat.S_ISREG(st.st_mode):
@@ -119,12 +150,19 @@ def fingerprint(root: Path, paths: list[str]) -> dict[str, str]:
                     value = f"sha256={h.hexdigest()} size={st.st_size}"
             except OSError:
                 continue
-            prints[f.relative_to(root).as_posix()] = value
-    return prints
+            fp.files[f.relative_to(root).as_posix()] = value
+    return fp
 
 
-def fingerprint_changes(before: dict[str, str], after: dict[str, str]) -> list[dict[str, str]]:
-    """Which fingerprinted files were created, modified or deleted (paths only)."""
+def fingerprint_changes(before_fp: Fingerprint, after_fp: Fingerprint) -> list[dict[str, str]]:
+    """Which fingerprinted files were created, modified or deleted (paths only).
+
+    Files under a directory left unchecked on either side are not compared: one that grew
+    past the cap would otherwise look as if all its files had been deleted.
+    """
+    skip = tuple(before_fp.unchecked + after_fp.unchecked)
+    before = {p: v for p, v in before_fp.files.items() if not p.startswith(skip)}
+    after = {p: v for p, v in after_fp.files.items() if not p.startswith(skip)}
     changes = [{"path": p, "change": "created"} for p in after if p not in before]
     changes += [{"path": p, "change": "deleted"} for p in before if p not in after]
     changes += [{"path": p, "change": "modified"} for p in before if p in after and before[p] != after[p]]
@@ -277,14 +315,16 @@ def collect(
     report: dict[str, Any] | None,
     prior_paths: set[str] | None = None,
     ignored_changes: list[dict[str, str]] | None = None,
+    ignored_unchecked: list[str] | None = None,
 ) -> dict[str, Any]:
     """Compare the tree after a run with the task's baseline (cumulative) and the run's start (this attempt).
 
     Only paths the executor touched during one of this task's attempts are attributed
     to it (`prior_paths` holds those of earlier attempts). Files created between
     attempts, such as artifacts of the engine's own check runs, are not.
-    `ignored_changes` are sensitive files outside git that the executor's attempts
+    `ignored_changes` are gitignored sensitive files that the executor's attempts
     changed (see fingerprint): snapshots can't see them, so they are added here.
+    `ignored_unchecked` are the directories among them too large to fingerprint.
     """
     after = snapshot(root)
     max_patch = cfg.get("limits", "evidence_output_bytes") * 3
@@ -308,9 +348,12 @@ def collect(
         if cfg.requires_approval(action):
             flags.append({"action": action, "detail": detail})
 
-    sensitive = classes.sensitive + [f"{c['path']} ({c['change']}, outside git)" for c in ignored_changes]
-    if sensitive:
-        flag("sensitive_file", ", ".join(sensitive))
+    if classes.sensitive:
+        flag("sensitive_file", ", ".join(classes.sensitive))
+    if ignored_changes:
+        # Not sensitive_file, which a policy can make automatic: no diff shows these edits, so a
+        # person has to look at the files, even when the task's scope allows them.
+        flag("secrets_change", ", ".join(f"{c['path']} ({c['change']}, outside git)" for c in ignored_changes))
     if classes.dependency:
         flag("dependency_change", ", ".join(classes.dependency))
     if classes.migration:
@@ -335,6 +378,7 @@ def collect(
         "attempt_patch": attempt_patch,
         "attempt_patch_truncated": attempt_truncated,
         "ignored_sensitive_changes": ignored_changes,
+        "ignored_sensitive_unchecked": sorted(ignored_unchecked or []),
         "scope_violations": violations,
         "policy_flags": flags,
         "report": report,
